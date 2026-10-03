@@ -98,6 +98,17 @@ static int dock_hover = -1;
 static volatile pid_t foreign_pid = 0;
 static int lock_screen = 0;
 static int have_fb = 0;
+/* First-run help overlay: shown until the user opens something or dismisses
+   it, so a new user is never stuck wondering how to reach the apps. It waits
+   for the setup wizard to finish before appearing, so it does not cover the
+   wizard itself. */
+static int show_help = 0;
+static int help_pending = 0;
+static int help_seen_wizard = 0;
+/* Set whenever something in the frame changed; when nothing is dirty the
+   shell skips the expensive desktop recomposite. Software (non-KVM) VMs
+   otherwise redraw a full-screen window blit every frame. */
+static int shell_dirty = 1;
 
 static const slop_color WALL_TOP = 0x10131f;
 static const slop_color WALL_BOT = 0x08090f;
@@ -122,11 +133,12 @@ static window_t *win_by_id(int id) {
 /* Move a window to the top of the stack and make it active. */
 static void raise_id(int id) {
     int idx = win_index(id);
-    if (idx < 0 || idx == MAX_WIN - 1) { if (idx >= 0) active = idx; return; }
+    if (idx < 0 || idx == MAX_WIN - 1) { if (idx >= 0) active = idx; shell_dirty = 1; return; }
     window_t tmp = wins[idx];
     for (int j = idx; j < MAX_WIN - 1; j++) wins[j] = wins[j + 1];
     wins[MAX_WIN - 1] = tmp;
     active = MAX_WIN - 1;
+    shell_dirty = 1;
 }
 static void send_to_win(window_t *w, slop_msg *m) {
     if (w && w->fd >= 0) slop_send_msg(w->fd, m);
@@ -153,10 +165,10 @@ static void toast(const char *title, const char *body, slop_color accent) {
     snprintf(t->title, sizeof(t->title), "%s", title);
     snprintf(t->body, sizeof(t->body), "%s", body);
     t->accent = accent;
-    t->ttl = 4200;
+    t->ttl = 9000;
     t->born = slop_ticks_ms();
 }
-static void tick_toasts(int dt) {
+static int tick_toasts(int dt) {
     int changed = 0;
     for (int i = 0; i < ntoasts; i++) { toasts[i].ttl -= dt; if (toasts[i].ttl <= 0) changed = 1; }
     if (changed) {
@@ -164,11 +176,13 @@ static void tick_toasts(int dt) {
         for (int i = 0; i < ntoasts; i++) if (toasts[i].ttl > 0) toasts[j++] = toasts[i];
         ntoasts = j;
     }
+    return changed;
 }
 
 /* ============================================================== launching */
 static int launch(int idx) {
     const app_entry *a = &APPS[idx];
+    show_help = 0;
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
@@ -206,6 +220,7 @@ static void drop_window(window_t *w) {
     if (w->fd >= 0) { close(w->fd); w->fd = -1; }
     w->used = 0;
     if (active >= 0 && &wins[active] == w) active = -1;
+    shell_dirty = 1;
 }
 static void accept_client(void) {
     int fd = accept(listen_fd, NULL, NULL);
@@ -240,6 +255,7 @@ static void accept_client(void) {
     welcome.focused = 1;
     slop_send_msg(fd, &welcome);
     raise_id(w->id);
+    shell_dirty = 1;
 }
 
 static void service_client(int i) {
@@ -266,11 +282,12 @@ static void service_client(int i) {
                 if (p != MAP_FAILED) { w->pixels = p; w->buf_w = sw; w->buf_h = sh; }
                 close(fd);
                 w->dirty = 1;
+                shell_dirty = 1;
             }
             break;
-        case SLOP_MSG_FRAME: w->dirty = 1; break;
-        case SLOP_MSG_SET_TITLE: snprintf(w->title, sizeof(w->title), "%s", m.title); break;
-        case SLOP_MSG_SET_ICON: w->icon = m.icon; break;
+        case SLOP_MSG_FRAME: w->dirty = 1; shell_dirty = 1; break;
+        case SLOP_MSG_SET_TITLE: snprintf(w->title, sizeof(w->title), "%s", m.title); shell_dirty = 1; break;
+        case SLOP_MSG_SET_ICON: w->icon = m.icon; shell_dirty = 1; break;
         case SLOP_MSG_BYE: drop_window(w); return;
         default: break;
         }
@@ -279,36 +296,45 @@ static void service_client(int i) {
 }
 
 /* ======================================================= input routing */
+/* App coordinates are relative to the client surface, which the shell blits
+   at (w->x + BORDER, w->y + TITLEBAR_H). Screen coordinates must be shifted by
+   the same origin, not just w->x/w->y, or every click lands a titlebar high. */
+static void to_client(window_t *w, int mx, int my, int *cx, int *cy) {
+    *cx = mx - w->x - BORDER;
+    *cy = my - w->y - TITLEBAR_H - BORDER;
+}
 static void route_motion(window_t *w, int mx, int my) {
     slop_msg m = {0};
     m.type = SLOP_MSG_EVENT; m.magic = SLOP_PROTO_MAGIC; m.kind = SLOP_PEV_MOTION;
-    m.x = mx - w->x; m.y = my - w->y;
+    to_client(w, mx, my, &m.x, &m.y);
     send_to_win(w, &m);
 }
 static void route_button(window_t *w, int down, int btn, int mx, int my) {
     slop_msg m = {0};
     m.type = SLOP_MSG_EVENT; m.magic = SLOP_PROTO_MAGIC;
     m.kind = down ? SLOP_PEV_BUTTON_DOWN : SLOP_PEV_BUTTON_UP;
-    m.button = btn; m.x = mx - w->x; m.y = my - w->y;
+    m.button = btn;
+    to_client(w, mx, my, &m.x, &m.y);
     send_to_win(w, &m);
 }
 static void route_wheel(window_t *w, int wheel, int mx, int my) {
     slop_msg m = {0};
     m.type = SLOP_MSG_EVENT; m.magic = SLOP_PROTO_MAGIC;
-    m.kind = SLOP_PEV_WHEEL; m.wheel = wheel; m.x = mx - w->x; m.y = my - w->y;
+    m.kind = SLOP_PEV_WHEEL; m.wheel = wheel;
+    to_client(w, mx, my, &m.x, &m.y);
     send_to_win(w, &m);
 }
 static void route_key(window_t *w, const slop_event *e) {
     slop_msg m = {0};
     m.type = SLOP_MSG_EVENT; m.magic = SLOP_PROTO_MAGIC;
     m.kind = SLOP_PEV_KEY; m.code = e->code; m.key = e->key; m.mods = e->mods;
-    m.x = slop.mouse_x - w->x; m.y = slop.mouse_y - w->y;
+    to_client(w, slop.mouse_x, slop.mouse_y, &m.x, &m.y);
     send_to_win(w, &m);
     if (e->ch) {
         slop_msg t = {0};
         t.type = SLOP_MSG_EVENT; t.magic = SLOP_PROTO_MAGIC;
         t.kind = SLOP_PEV_TEXT; t.ch = e->ch; t.mods = e->mods;
-        t.x = slop.mouse_x - w->x; t.y = slop.mouse_y - w->y;
+        to_client(w, slop.mouse_x, slop.mouse_y, &t.x, &t.y);
         send_to_win(w, &t);
     }
 }
@@ -399,7 +425,17 @@ static int frame_hit(window_t *w, int mx, int my, int *edge) {
 }
 
 /* =========================================================== desktop art */
-static void draw_desktop(void) {
+/* The wallpaper never changes, so it is painted once into a cached buffer and
+   blitted each frame. Redrawing the full-screen gradient plus the star dither
+   every frame dominated the frame time on software (non-KVM) machines. */
+static slop_color *wall_cache = NULL;
+
+static void build_wallpaper(void) {
+    size_t n = (size_t)slop.w * slop.h;
+    wall_cache = malloc(n * sizeof(slop_color));
+    if (!wall_cache) return;
+    slop_color *save = slop.back;
+    slop.back = wall_cache;
     slop_vgradient(0, 0, slop.w, slop.h, WALL_TOP, WALL_BOT);
     float p = slop_pulse(9000);
     int cx = slop.w / 2;
@@ -420,6 +456,12 @@ static void draw_desktop(void) {
     for (int y = 0; y < slop.h; y += 3)
         for (int x = 0; x < slop.w; x += 3)
             slop_blend(x, y, SLOP_RGB(0xff, 0xff, 0xff), 5);
+    slop.back = save;
+}
+
+static void draw_desktop(void) {
+    if (!wall_cache) { build_wallpaper(); if (!wall_cache) return; }
+    memcpy(slop.back, wall_cache, (size_t)slop.w * slop.h * sizeof(slop_color));
 }
 
 /* ============================================================== the panel */
@@ -630,6 +672,44 @@ static void draw_notif_center(void) {
     if (ui.released && !(ui.mx >= x && ui.mx < x + w && ui.my >= y && ui.my < y + h)) notif_open = 0;
 }
 
+/* ============================================================ help overlay */
+/* A short, always-visible-until-dismissed cheat sheet. The old build relied on
+   a 4-second toast, which users missed and then had no way to rediscover. */
+static void draw_help(void) {
+    int w = 460, h = 250;
+    int x = (slop.w - w) / 2, y = (slop.h - h) / 2 - 40;
+    slop_shadow(x, y, w, h, 20, 140);
+    slop_fill_round(x, y, w, h, 18, slop_theme_dark.surface);
+    slop_round_outline(x, y, w, h, 18, 1, slop_theme_dark.border_hi);
+
+    slop_text(&slop_font_title, x + 28, y + 46, "Welcome to SlopOS", slop_theme_dark.text);
+    slop_text(&slop_font_small, x + 28, y + 72,
+              "Here is how to get around. This card stays until you dismiss it.",
+              slop_theme_dark.text_dim);
+
+    const char *rows[][2] = {
+        { "Open an app",   "Click an icon in the dock below, or press 1-9" },
+        { "All apps",      "Press M for the launcher" },
+        { "Close window",  "Ctrl+Q, or the title-bar button" },
+        { "Show desktop",  "Press Esc to dismiss menus and this card" },
+    };
+    for (int i = 0; i < 4; i++) {
+        int ry = y + 100 + i * 30;
+        slop_fill_round(x + 28, ry - 12, 8, 8, 4, slop_theme_dark.accent);
+        slop_text(&slop_font_body, x + 46, ry, rows[i][0], slop_theme_dark.text);
+        slop_text(&slop_font_small, x + 200, ry, rows[i][1], slop_theme_dark.text_dim);
+    }
+
+    int bw = 170, bh = 38;
+    slop_button b = { x + w - 28 - bw, y + h - 28 - bh, bw, bh,
+                      "Got it", 1, 1, 0, 0 };
+    if (slop_button_draw(&b) || ui.key == SLOP_KEY_ESC || ui.released) {
+        show_help = 0;
+        int fd = open("/home/user/.config/slop/seen-help", O_WRONLY | O_CREAT, 0644);
+        if (fd >= 0) close(fd);
+    }
+}
+
 /* ================================================================ dock */
 static void draw_dock(void) {
     int n = NAPPS, isz = 50, gap = 12;
@@ -711,6 +791,7 @@ static void maybe_autostart(void) {
     close(fd);
     if (r <= 0) return;
     unlink("/run/slop/autostart");
+    show_help = 0;
     /* trim */
     for (char *p = buf; *p; p++) if (*p == '\n' || *p == '\r' || *p == ' ') { *p = 0; break; }
     if (!buf[0]) return;
@@ -751,9 +832,11 @@ int main(void) {
     install_socket();
     slop_event_hook = route_event;
     slop_flush_events();
+    show_help = 0;
+    help_pending = (access("/home/user/.config/slop/seen-help", F_OK) != 0);
     maybe_autostart();
 
-    toast("Welcome to SlopOS 0.2", "Windows, a real dock, and a fresh coat of paint",
+    toast("Welcome to SlopOS 0.2", "Open apps from the dock, or press 1-9 / M",
           slop_theme_dark.accent);
 
     int last_tick = slop_ticks_ms();
@@ -772,11 +855,30 @@ int main(void) {
         }
 
         slop_begin_frame();
+        if (ui.moved || ui.down || ui.pressed || ui.released || ui.rdown ||
+            ui.rpressed || ui.ntext || ui.key || ui.wheel)
+            shell_dirty = 1;
+
+        /* The setup wizard is the only window on first boot. Once it has
+           appeared and then closed, offer the help card. */
+        if (help_pending) {
+            int wizard_open = 0;
+            for (int i = 0; i < MAX_WIN; i++)
+                if (wins[i].used && strstr(wins[i].title, "Setup")) wizard_open = 1;
+            if (wizard_open) {
+                help_seen_wizard = 1;
+            } else if (help_seen_wizard) {
+                show_help = 1;
+                help_pending = 0;
+                shell_dirty = 1;
+            }
+        }
 
         int now = slop_ticks_ms();
         int dt = now - last_tick;
         last_tick = now;
-        tick_toasts(dt);
+        if (tick_toasts(dt)) shell_dirty = 1;
+        if (ntoasts > 0) shell_dirty = 1;   /* toasts slide and expire every frame */
 
         /* alt-tab */
         if (ui.key == SLOP_KEY_TAB && (ui.alt || ui.super)) alt_tab_active = 1;
@@ -878,33 +980,44 @@ int main(void) {
             else if (c == 'l' || c == 'L') lock_screen = !lock_screen;
         }
 
-        /* draw */
-        draw_desktop();
-        for (int i = 0; i < MAX_WIN; i++) {
-            if (!wins[i].used || wins[i].minimized) continue;
-            draw_window(&wins[i], i == active);
-        }
-        draw_panel();
-        draw_dock();
-        if (menu_open) draw_launcher();
-        if (qs_open) draw_quick_settings();
-        if (cal_open) draw_calendar();
-        if (notif_open) draw_notif_center();
-        if (alt_tab_active) draw_alt_tab();
-        draw_toasts();
-        if (lock_screen) {
-            slop_fill_rect_a(0, 0, slop.w, slop.h, 0, 240);
-            const char *ttl = "SlopOS";
-            slop_text(&slop_font_title, slop.w / 2 - slop_text_w(&slop_font_title, ttl) / 2,
-                      slop.h / 2, ttl, slop_theme_dark.text);
-            const char *m = "Screen locked. Press any key to unlock.";
-            slop_text(&slop_font_small, slop.w / 2 - slop_text_w(&slop_font_small, m) / 2,
-                      slop.h / 2 + 30, m, slop_theme_dark.text_mute);
-            if (ui.ntext || ui.key) lock_screen = 0;
+        /* draw. When nothing changed, the composed frame from last time is
+           still valid, so we only redraw the software cursor and present. This
+           keeps an idle desktop nearly free on slow, non-accelerated VMs. */
+        int need_present = 0;
+        if (shell_dirty) {
+            draw_desktop();
+            for (int i = 0; i < MAX_WIN; i++) {
+                if (!wins[i].used || wins[i].minimized) continue;
+                draw_window(&wins[i], i == active);
+            }
+            draw_panel();
+            draw_dock();
+            if (menu_open) draw_launcher();
+            if (qs_open) draw_quick_settings();
+            if (cal_open) draw_calendar();
+            if (notif_open) draw_notif_center();
+            if (alt_tab_active) draw_alt_tab();
+            if (show_help && !lock_screen) draw_help();
+            draw_toasts();
+            if (lock_screen) {
+                slop_fill_rect_a(0, 0, slop.w, slop.h, 0, 240);
+                const char *ttl = "SlopOS";
+                slop_text(&slop_font_title, slop.w / 2 - slop_text_w(&slop_font_title, ttl) / 2,
+                          slop.h / 2, ttl, slop_theme_dark.text);
+                const char *m = "Screen locked. Press any key to unlock.";
+                slop_text(&slop_font_small, slop.w / 2 - slop_text_w(&slop_font_small, m) / 2,
+                          slop.h / 2 + 30, m, slop_theme_dark.text_mute);
+                if (ui.ntext || ui.key) lock_screen = 0;
+            }
+            shell_dirty = 0;
+            need_present = 1;
+        } else if (ui.moved) {
+            /* only the pointer moved: restore the old cursor and redraw it */
+            need_present = 1;
         }
 
-        slop_end_frame();
-        usleep(4000);
+        if (need_present) slop_end_frame();
+        usleep(2000);
     }
     slop_shutdown();
     return 0;

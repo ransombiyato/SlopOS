@@ -174,6 +174,8 @@ void slop_blit_rgba(const uint8_t *rgba, int iw, int ih, int x, int y, int alpha
 int  slop_poll(slop_event *e);       /* 1 if an event was produced */
 int  slop_wait_event(slop_event *e, int timeout_ms);
 void slop_flush_events(void);
+int  slop_input_ready(void);
+void slop_rescan_input(void);
 void slop_set_cursor(int x, int y);
 void slop_draw_cursor(void);         /* draws arrow cursor at pointer */
 int  slop_ticks_ms(void);
@@ -200,9 +202,11 @@ float slop_pulse(int period_ms);
  */
 typedef struct {
     int  mx, my;          /* pointer */
+    int  moved;           /* pointer changed position this frame */
     int  down;            /* left button held */
     int  pressed;         /* left button went down this frame */
     int  released;        /* left button went up this frame */
+    int  press_mx, press_my; /* pointer position where the left press began */
     int  rdown, rpressed; /* right button */
     int  wheel;           /* accumulated wheel this frame (+down) */
     int  shift, ctrl, alt, super;

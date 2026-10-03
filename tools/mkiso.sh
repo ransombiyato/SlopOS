@@ -17,6 +17,18 @@ mkdir -p "$ISODIR/boot/grub/themes/slopos"
 cp -f "$KERNEL" "$ISODIR/boot/bzImage"
 cp -f "$INITRD" "$ISODIR/boot/initramfs.cpio.gz"
 
+# Bundled third-party app packages ride on the ISO, not in the initramfs.
+# setup/slop-install read them from /media/cdrom/packages.
+mkdir -p "$ISODIR/packages"
+for p in zen obs; do
+  if [ -f "dist/pkg/$p.pkg" ] && [ -f "dist/pkg/$p.tar.xz" ]; then
+    cp -f "dist/pkg/$p.pkg" "dist/pkg/$p.tar.xz" "$ISODIR/packages/"
+    echo ">> ISO carries $p package ($(du -h "dist/pkg/$p.tar.xz" | cut -f1))"
+  else
+    echo "!! dist/pkg/$p missing; run tools/stage-$p.sh + tools/mkpackage.sh"
+  fi
+done
+
 # branded boot menu (falls back to the plain menu if assets are missing)
 if [ -f branding/grub/background.png ] && [ -f branding/grub/theme.txt ]; then
   cp -f branding/grub/background.png branding/grub/theme.txt \
@@ -51,12 +63,12 @@ terminal_output gfxterm
 $THEME
 
 menuentry "SlopOS 0.2" {
-    linux /boot/bzImage quiet loglevel=3 console=ttyS0,115200 rdinit=/init
+    linux /boot/bzImage quiet loglevel=3 vt.global_cursor_default=0 console=ttyS0,115200 rdinit=/init
     initrd /boot/initramfs.cpio.gz
 }
 
 menuentry "SlopOS 0.2 (verbose boot)" {
-    linux /boot/bzImage loglevel=7 console=ttyS0,115200 rdinit=/init
+    linux /boot/bzImage loglevel=7 vt.global_cursor_default=0 console=ttyS0,115200 rdinit=/init
     initrd /boot/initramfs.cpio.gz
 }
 EOF

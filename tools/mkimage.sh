@@ -16,9 +16,13 @@ mkdir -p "$ROOT"/etc/OpenCL/vendors
 # init and native apps are placed by make; verify they exist
 for f in init usr/bin/slop-shell usr/bin/slop-files usr/bin/slop-term \
          usr/bin/slop-image usr/bin/slop-view usr/bin/slop-about \
-         usr/bin/slop-open usr/bin/slop-launch usr/bin/slop-xsession; do
+         usr/bin/slop-open usr/bin/slop-launch usr/bin/slop-xsession usr/bin/slop-setup; do
   [ -x "$ROOT/$f" ] || { echo "!! missing $ROOT/$f (run 'make user')"; exit 1; }
 done
+
+# The installer is a POSIX shell script: it unpacks app packages with busybox,
+# so installing needs no native helper.
+install -m 0755 apps/slop-install.sh "$ROOT/usr/bin/slop-install"
 
 # busybox provides the classic unix userland that third-party apps and shells
 # expect (ls, cat, grep, mount, ...). Our own apps are separate binaries.
@@ -105,6 +109,17 @@ fi
 
 # compatibility manifests
 cp -f compat/apps/*.app "$ROOT/usr/share/slop/compat/"
+
+# The installer is a POSIX shell script: it unpacks app packages with busybox,
+# so installing needs no native helper.
+install -m 0755 apps/slop-install.sh "$ROOT/usr/bin/slop-install"
+
+# Bundled third-party app packages live on the installation medium, not in the
+# initramfs: they are hundreds of megabytes and already compressed, so packing
+# them into the ramdisk would waste RAM and boot time. mkiso.sh copies them
+# into the ISO's /packages, and slop-install reads them from there (or from
+# /usr/share/slop/packages once installed).
+mkdir -p "$ROOT/usr/share/slop/packages"
 
 # a couple of sample files so the viewers have something to show
 cat > "$ROOT/home/user/readme.txt" <<'EOF'

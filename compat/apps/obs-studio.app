@@ -10,7 +10,7 @@ id          = obs
 icon        = obs
 runtime     = compat
 
-exec        = /opt/obs/bin/obs
+exec        = /opt/obs/obs
 exec        = /usr/bin/obs
 exec        = flatpak run com.obsproject.Studio
 

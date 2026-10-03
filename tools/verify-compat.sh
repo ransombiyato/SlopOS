@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 APP="${1:-zen}"
 case "$APP" in
   zen)     ICON=5;  PATH_EXE=/opt/zen/zen           ;;
-  obs)     ICON=6;  PATH_EXE=/opt/obs/bin/obs       ;;
+  obs)     ICON=6;  PATH_EXE=/opt/obs/obs       ;;
   resolve) ICON=7;  PATH_EXE=/opt/davinci/bin/resolve ;;
   *) echo "unknown app: $APP (zen|obs|resolve)"; exit 2;;
 esac

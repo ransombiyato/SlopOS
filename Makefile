@@ -24,7 +24,7 @@ FONT    := libslop/font_data.h
 
 SHELL_BIN := $(BIN)/slop-shell
 INIT_BIN  := $(ROOT)/init
-APPS := files term image view about open calc monitor settings notes
+APPS := files term image view about open calc monitor settings notes setup
 APP_BINS := $(addprefix $(BIN)/slop-,$(APPS))
 COMPAT_BIN := $(BIN)/slop-launch
 XSESSION_BIN := $(BIN)/slop-xsession

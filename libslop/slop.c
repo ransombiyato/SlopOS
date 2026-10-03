@@ -35,6 +35,14 @@ slop_display slop;
 static int kbd_fd = -1;
 static int mouse_fds[4]; static int mouse_n = 0;
 
+/* Pixels under the software cursor, saved so they can be restored before the
+   next frame redraws the back buffer (see slop_draw_cursor / slop_begin_frame). */
+#define CURSOR_MAX_PX 128
+static int        cursor_saved_x[CURSOR_MAX_PX];
+static int        cursor_saved_y[CURSOR_MAX_PX];
+static slop_color cursor_saved_c[CURSOR_MAX_PX];
+static int        cursor_saved_n = 0;
+
 /* ---------------------------------------------------- compositor plumbing */
 static uint32_t *comp_surface = NULL;   /* memfd-backed surface we share */
 static size_t    comp_surface_size = 0;
@@ -698,11 +706,22 @@ static void open_input_devices(void) {
         snprintf(path, sizeof(path), "/dev/input/%s", de->d_name);
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
+        int dup = 0;
+        if (kbd_fd == fd) dup = 1;
+        for (int i = 0; i < mouse_n; i++) if (mouse_fds[i] == fd) dup = 1;
+        if (dup) { close(fd); continue; }
         if (kbd_fd < 0 && device_is_keyboard(fd)) { kbd_fd = fd; continue; }
         if (mouse_n < 4 && device_is_mouse(fd)) { mouse_fds[mouse_n++] = fd; continue; }
         close(fd);
     }
     closedir(d);
+}
+
+/* devtmpfs is populated asynchronously, so input nodes may not exist yet when
+   a program starts. Apps call this each frame until input is available. */
+int slop_input_ready(void) { return kbd_fd >= 0 || mouse_n > 0; }
+void slop_rescan_input(void) {
+    if (kbd_fd < 0 || mouse_n == 0) open_input_devices();
 }
 
 static int pump_one(slop_event *e) {
@@ -767,11 +786,19 @@ static int pump_one(slop_event *e) {
 }
 
 int slop_poll(slop_event *e) {
-    if (slop.composited) comp_pump();
-    if (comp_qh != comp_qt) {
-        *e = comp_q[comp_qh];
-        comp_qh = (comp_qh + 1) % COMP_QMAX;
-        return 1;
+    if (slop.composited) {
+        /* A composited app must not read /dev/input itself: the shell is the
+           single input owner and forwards window-relative events. Reading the
+           raw device here would deliver unshifted absolute coordinates and
+           double every click. */
+        comp_pump();
+        if (comp_qh != comp_qt) {
+            *e = comp_q[comp_qh];
+            comp_qh = (comp_qh + 1) % COMP_QMAX;
+            return 1;
+        }
+        memset(e, 0, sizeof(*e));
+        return 0;
     }
     memset(e, 0, sizeof(*e));
     return pump_one(e);
@@ -798,12 +825,35 @@ void slop_draw_cursor(void) {
         "X.......X  ", "X....XXXXX ", "X..X..X    ", "X.X X..X   ",
         "XX  X..X   ", "X    X..X  ", "     X..X  ", "      XX   ",
     };
+    /* Save the pixels the cursor is about to cover so they can be restored
+       before the next frame. Without this, a static (cached) wallpaper would
+       accumulate cursor "smear" when the cursor moves. */
+    cursor_saved_n = 0;
+    for (int j = 0; j < 16; j++) {
+        for (int i = 0; shape[j][i]; i++) {
+            if (shape[j][i] != 'X' && shape[j][i] != '.') continue;
+            int px = x + i, py = y + j;
+            if (px < 0 || px >= slop.w || py < 0 || py >= slop.h) continue;
+            if (cursor_saved_n < (int)(sizeof(cursor_saved_x) / sizeof(cursor_saved_x[0]))) {
+                cursor_saved_x[cursor_saved_n] = px;
+                cursor_saved_y[cursor_saved_n] = py;
+                cursor_saved_c[cursor_saved_n] = slop.back[(size_t)py * slop.w + px];
+                cursor_saved_n++;
+            }
+        }
+    }
     for (int j = 0; j < 16; j++)
         for (int i = 0; shape[j][i]; i++)
             if (shape[j][i] == 'X') put(x + i, y + j, SLOP_RGB(0, 0, 0));
     for (int j = 0; j < 16; j++)
         for (int i = 0; shape[j][i]; i++)
             if (shape[j][i] == '.') put(x + i, y + j, SLOP_RGB(255, 255, 255));
+}
+
+static void cursor_restore(void) {
+    for (int k = 0; k < cursor_saved_n; k++)
+        slop.back[(size_t)cursor_saved_y[k] * slop.w + cursor_saved_x[k]] = cursor_saved_c[k];
+    cursor_saved_n = 0;
 }
 
 int slop_ticks_ms(void) {
@@ -862,9 +912,12 @@ void slop_shutdown(void) {
 slop_input ui;
 void (*slop_event_hook)(const slop_event *e) = NULL;
 static int prev_left_down = 0, prev_right_down = 0;
+static int prev_mouse_x = -1, prev_mouse_y = -1;
 static int last_frame_ms = 0;
 
 void slop_begin_frame(void) {
+    cursor_restore();   /* undo last frame's cursor before the app redraws */
+    slop_rescan_input();
     int now = slop_ticks_ms();
     ui.dt_ms = last_frame_ms ? now - last_frame_ms : 16;
     if (ui.dt_ms > 200) ui.dt_ms = 200;
@@ -913,11 +966,14 @@ void slop_begin_frame(void) {
         default: break;
         }
     }
-    if (ui.down && !prev_left_down) ui.pressed = 1;
+    if (ui.down && !prev_left_down) { ui.pressed = 1; ui.press_mx = slop.mouse_x; ui.press_my = slop.mouse_y; }
     if (!ui.down && prev_left_down) ui.released = 1;
     if (ui.rdown && !prev_right_down) ui.rpressed = 1;
     prev_left_down = ui.down;
     prev_right_down = ui.rdown;
+    ui.moved = (slop.mouse_x != prev_mouse_x || slop.mouse_y != prev_mouse_y);
+    prev_mouse_x = slop.mouse_x;
+    prev_mouse_y = slop.mouse_y;
     ui.mx = slop.mouse_x;
     ui.my = slop.mouse_y;
     if (comp_close_requested) { ui.quit = 1; comp_close_requested = 0; }
@@ -936,6 +992,11 @@ static int in_rect(int mx, int my, int x, int y, int w, int h) {
 
 int slop_button_draw(slop_button *b) {
     int hot = in_rect(ui.mx, ui.my, b->x, b->y, b->w, b->h);
+    /* Buttons are usually rebuilt every frame, so a `held` flag cannot survive
+       from press to release. `ui.press_mx/press_my` (recorded by
+       slop_begin_frame) keeps the press origin across frames, so a click is a
+       release whose press began inside this button. */
+    int press_inside = in_rect(ui.press_mx, ui.press_my, b->x, b->y, b->w, b->h);
     int clicked = 0;
     b->hot = hot;
     if (!b->enabled) {
@@ -945,13 +1006,9 @@ int slop_button_draw(slop_button *b) {
                           b->y, b->h, b->label, slop_theme_dark.text_mute);
         return 0;
     }
-    if (hot && ui.pressed) b->held = 1;
-    if (ui.released) {
-        if (b->held && hot) clicked = 1;
-        b->held = 0;
-    }
+    if (ui.released && press_inside) clicked = 1;
     slop_color base = b->primary ? slop_theme_dark.accent : slop_theme_dark.surface_hi;
-    if (b->held && hot) base = b->primary ? slop_theme_dark.accent_lo : slop_theme_dark.surface_lo;
+    if (ui.down && press_inside) base = b->primary ? slop_theme_dark.accent_lo : slop_theme_dark.surface_lo;
     else if (hot) base = b->primary ? slop_theme_dark.accent_hi : slop_theme_dark.border_hi;
     slop_fill_round(b->x, b->y, b->w, b->h, 8, base);
     if (!b->primary)
