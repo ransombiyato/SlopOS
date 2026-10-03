@@ -98,3 +98,19 @@ compatibility manifest id (`x11-demo`). Used only by the verify scripts.
 - `compat/slop-launch.c` — compat runtime; manifests in `compat/apps/*.app`.
 - `kernel/build.sh` — kernel config knobs (DRM, evdev, V4L2, seccomp, …).
 - `tools/mkimage.sh`, `tools/mkiso.sh`, `tools/screenshot.py`.
+
+## Repository / migration state
+- This workspace (`/workspace/project`) is the SlopOS source of truth. Its git
+  history is self-contained (no remote push has succeeded from this sandbox).
+- Target GitHub repo: `ransombiyato/AboIDE` (default branch `main`). It is to be
+  renamed and its AboIDE content fully replaced by SlopOS. The environment's
+  `GITHUB_TOKEN` is a read-only GitHub App token: every write (push, ref
+  create, repo rename) returns 403, so the transfer must be completed with a
+  credential that has `contents: write` (and repo-admin for the rename).
+- Portable full-history archive: `/workspace/slopos-aurora.bundle`
+  (`git bundle verify` passes; HEAD = master = 775226c).
+- To complete the transfer once write access exists:
+  `git push --force https://<user>:<token>@github.com/ransombiyato/AboIDE.git master:main`
+  then `PATCH /repos/ransombiyato/AboIDE {"name":"SlopOS"}`.
+- SlopOS `AGENTS.md`/`README.md` should be renamed if the project name changes.
+
