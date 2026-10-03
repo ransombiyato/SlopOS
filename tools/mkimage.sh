@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Assemble the SlopOS root filesystem and pack it into an initramfs.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+ROOT=dist/rootfs
+BUSYBOX=/usr/bin/busybox
+
+echo ">> staging rootfs"
+mkdir -p "$ROOT"/{bin,usr/bin,sbin,etc,proc,sys,dev,tmp,run,home/user}
+mkdir -p "$ROOT"/home/user/{Desktop,Documents,Pictures,Downloads,Music,Videos}
+mkdir -p "$ROOT"/usr/share/slop/compat
+mkdir -p "$ROOT"/opt/{zen,obs,davinci}
+mkdir -p "$ROOT"/etc/OpenCL/vendors
+
+# init and native apps are placed by make; verify they exist
+for f in init usr/bin/slop-shell usr/bin/slop-files usr/bin/slop-term \
+         usr/bin/slop-image usr/bin/slop-view usr/bin/slop-about \
+         usr/bin/slop-open usr/bin/slop-launch; do
+  [ -x "$ROOT/$f" ] || { echo "!! missing $ROOT/$f (run 'make user')"; exit 1; }
+done
+
+# busybox provides the classic unix userland that third-party apps and shells
+# expect (ls, cat, grep, mount, ...). Our own apps are separate binaries.
+if [ -x "$BUSYBOX" ]; then
+  cp -f "$BUSYBOX" "$ROOT/bin/busybox"
+  ( cd "$ROOT/bin" && for applet in $(./busybox --list); do
+      [ "$applet" = busybox ] || ln -sf busybox "$applet"
+    done )
+  cp -f "$ROOT/bin/sh" "$ROOT/usr/bin/sh" 2>/dev/null || true
+else
+  echo "!! busybox not found; install busybox-static"
+fi
+
+# our binaries also live under /bin for convenience
+for b in slop-shell slop-files slop-term slop-image slop-view slop-about slop-open slop-launch; do
+  ln -sf "/usr/bin/$b" "$ROOT/bin/$b"
+done
+
+# compatibility manifests
+cp -f compat/apps/*.app "$ROOT/usr/share/slop/compat/"
+
+# a couple of sample files so the viewers have something to show
+cat > "$ROOT/home/user/readme.txt" <<'EOF'
+Welcome to SlopOS
+=================
+
+This is a small, from-scratch x86_64 desktop. Everything you see is drawn
+directly to the framebuffer by our own toolkit (libslop); there is no X11 or
+Wayland server underneath the native apps.
+
+Try these:
+
+  * Files        browse the home directory
+  * Terminal     run commands in a real pty
+  * Image Viewer open a PNG or JPEG
+  * File Viewer  read this file with syntax colouring
+  * System Info  see live values from /proc
+
+Third-party apps (Zen Browser, OBS Studio, DaVinci Resolve) run through the
+SlopOS compatibility runtime, which verifies their kernel and library
+requirements before launching them.
+
+Tip: press Ctrl+Q or the red traffic light to leave any app.
+EOF
+
+cat > "$ROOT/home/user/hello.c" <<'EOF'
+/* A sample C file so the File Viewer has something to colour. */
+#include <stdio.h>
+
+int main(void) {
+    for (int i = 0; i < 3; i++) {
+        printf("hello from SlopOS %d\n", i);
+    }
+    return 0;
+}
+EOF
+
+cat > "$ROOT/etc/motd" <<'EOF'
+SlopOS 0.1 -- a smooth little x86_64 desktop
+EOF
+
+# sample images for the image viewer (generated at build time; needs Pillow)
+if python3 -c "import PIL" 2>/dev/null; then
+  python3 - "$ROOT/home/user/Pictures" <<'PY'
+import sys
+from PIL import Image, ImageDraw
+out = sys.argv[1]
+w, h = 640, 400
+img = Image.new("RGB", (w, h))
+d = ImageDraw.Draw(img)
+for y in range(h):
+    t = y / h
+    d.line([(0, y), (w, y)], fill=(int(30+180*t), int(80+120*(1-t)), int(200-60*t)))
+d.ellipse([80, 80, 280, 280], fill=(255, 210, 90))
+d.rectangle([340, 120, 580, 300], fill=(74, 217, 154))
+d.polygon([(320, 340), (400, 220), (480, 340)], fill=(240, 106, 106))
+d.text((20, 20), "SlopOS sample image", fill=(255, 255, 255))
+img.save(out + "/sample.png")
+for name, col in [("one.png", (120, 140, 255)), ("two.png", (74, 217, 154)),
+                  ("three.png", (240, 180, 60))]:
+    t = Image.new("RGB", (200, 150), col)
+    ImageDraw.Draw(t).ellipse([40, 30, 160, 120], fill=(255, 255, 255))
+    t.save(out + "/" + name)
+print(">> sample images generated")
+PY
+else
+  echo "!! Pillow missing; skipping sample images"
+fi
+
+echo ">> packing initramfs"
+( cd "$ROOT" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9 ) > dist/initramfs.cpio.gz
+ls -lh dist/initramfs.cpio.gz
+echo ">> rootfs ready"

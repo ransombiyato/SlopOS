@@ -1,0 +1,17 @@
+# Build output
+dist/
+libslop/*.o
+
+# Linux kernel source and artifacts (large; rebuilt by kernel/build.sh)
+kernel/linux-*/
+kernel/dl/
+kernel/out/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+*.swp
+.DS_Store
+kernel/build.log

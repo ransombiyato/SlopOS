@@ -1,0 +1,29 @@
+# SlopOS GRUB theme
+title-text: ""
+desktop-image: "background.png"
+desktop-color: "#0c0e16"
+terminal-font: "Unifont Regular 16"
+terminal-box: "terminal_box_*.png"
+
++ boot_menu {
+    left = 25%
+    top = 58%
+    width = 50%
+    height = 30%
+    item_font = "Unifont Regular 16"
+    item_color = "#96a0b4"
+    selected_item_color = "#ffffff"
+    item_height = 26
+    item_padding = 6
+    item_spacing = 8
+}
+
++ label {
+    top = 94%
+    left = 0
+    width = 100%
+    align = "center"
+    color = "#5c6478"
+    font = "Unifont Regular 16"
+    text = "Enter to boot"
+}
