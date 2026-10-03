@@ -100,17 +100,12 @@ compatibility manifest id (`x11-demo`). Used only by the verify scripts.
 - `tools/mkimage.sh`, `tools/mkiso.sh`, `tools/screenshot.py`.
 
 ## Repository / migration state
-- This workspace (`/workspace/project`) is the SlopOS source of truth. Its git
-  history is self-contained (no remote push has succeeded from this sandbox).
-- Target GitHub repo: `ransombiyato/AboIDE` (default branch `main`). It is to be
-  renamed and its AboIDE content fully replaced by SlopOS. The environment's
-  `GITHUB_TOKEN` is a read-only GitHub App token: every write (push, ref
-  create, repo rename) returns 403, so the transfer must be completed with a
-  credential that has `contents: write` (and repo-admin for the rename).
+- Source of truth: `ransombiyato/SlopOS` (default branch `main`), formerly
+  `AboIDE`. The repo was renamed and its old IDE content fully replaced by
+  SlopOS via a force-push of `master` -> `main` (the previous `main`,
+  `6287ac3`, is recoverable from GitHub's reflog if ever needed).
+- This workspace (`/workspace/project`) mirrors that history on branch
+  `master`; push with `git push origin master:main`.
 - Portable full-history archive: `/workspace/slopos-aurora.bundle`
-  (`git bundle verify` passes; HEAD = master = 775226c).
-- To complete the transfer once write access exists:
-  `git push --force https://<user>:<token>@github.com/ransombiyato/AboIDE.git master:main`
-  then `PATCH /repos/ransombiyato/AboIDE {"name":"SlopOS"}`.
-- SlopOS `AGENTS.md`/`README.md` should be renamed if the project name changes.
+  (`git bundle verify` passes).
 
