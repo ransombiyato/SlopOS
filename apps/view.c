@@ -7,6 +7,7 @@
  */
 #define _GNU_SOURCE
 #include "../libslop/slop.h"
+#include "../libslop/slop_icons.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,7 +119,7 @@ static int draw_code_line(const char *s, int x, int baseline, slop_color base, c
 }
 
 int main(int argc, char **argv) {
-    if (slop_init() != 0) { fprintf(stderr, "slop-view: no framebuffer\n"); return 1; }
+    if (slop_app_start("File Viewer", SLOP_ICON_VIEW) != 0) { fprintf(stderr, "slop-view: no display\n"); return 1; }
     const char *start = argc > 1 ? argv[1] : "/home/user/readme.txt";
     struct stat st;
     if (stat(start, &st) == 0) load(start);

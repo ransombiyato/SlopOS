@@ -39,6 +39,7 @@ static void mount_all(void) {
     try_mount("tmpfs", "/tmp", "tmpfs", 0);
     try_mount("tmpfs", "/run", "tmpfs", 0);
     try_mount("tmpfs", "/dev/shm", "tmpfs", 0);
+    try_mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0);
     ensure_dir("/run/slop");
     ensure_dir("/tmp");
     ensure_dir("/home");
@@ -58,9 +59,32 @@ static void mount_all(void) {
     ensure_dir("/usr/share");
 }
 
+static void write_file(const char *path, const char *data) {
+    int fd = open(path, O_WRONLY);
+    if (fd >= 0) { ssize_t r = write(fd, data, strlen(data)); (void)r; close(fd); }
+}
+
 static void set_hostname(void) {
-    int fd = open("/proc/sys/kernel/hostname", O_WRONLY);
-    if (fd >= 0) { write(fd, "slopos", 6); close(fd); }
+    write_file("/proc/sys/kernel/hostname", "slopos");
+}
+
+/* Kernel knobs that make a small desktop feel nicer. */
+static void tune_sysctl(void) {
+    write_file("/proc/sys/vm/swappiness", "10");
+    write_file("/proc/sys/kernel/printk", "3 3 3 3");
+    write_file("/proc/sys/net/ipv4/ip_forward", "0");
+}
+
+/* Publish os-release so scripts and the shell can identify the system. */
+static void write_os_release(void) {
+    FILE *f = fopen("/etc/os-release", "w");
+    if (!f) return;
+    fputs("NAME=\"SlopOS\"\n"
+          "VERSION=\"0.2 (Aurora)\"\n"
+          "ID=slopos\n"
+          "PRETTY_NAME=\"SlopOS 0.2 (Aurora)\"\n"
+          "HOME_URL=\"https://slopos.local\"\n", f);
+    fclose(f);
 }
 
 /* ------------------------------------------------------------- boot splash */
@@ -125,7 +149,7 @@ int main(int argc, char **argv) {
         { "Starting SlopOS kernel services" },
         { "Mounting /proc, /sys and /dev" },
         { "Preparing the desktop session" },
-        { "Starting the window shell" },
+        { "Starting the Aurora window shell" },
     };
     const int total = (int)(sizeof(steps) / sizeof(steps[0]));
 
@@ -134,6 +158,8 @@ int main(int argc, char **argv) {
 
     mount_all();
     set_hostname();
+    tune_sysctl();
+    write_os_release();
 
     struct sigaction sa = {0};
     sa.sa_handler = reap;
@@ -152,7 +178,7 @@ int main(int argc, char **argv) {
         slop_shutdown();
     }
 
-    printf("\nSlopOS %s -- init ready (PID 1)\n\n", "0.1");
+    printf("\nSlopOS %s -- init ready (PID 1)\n\n", "0.2");
     fflush(stdout);
 
     for (;;) {

@@ -13,20 +13,26 @@
 CC      := gcc
 CFLAGS  := -std=gnu11 -O2 -Wall -Wextra -I libslop
 LDFLAGS := -static
-LDLIBS  := -lutil
+LDLIBS  := -lutil -lm
 
 DIST    := dist
 ROOT    := $(DIST)/rootfs
 BIN     := $(ROOT)/usr/bin
 
-LIBSLOP := libslop/slop.c
+LIBSLOP := libslop/slop.c libslop/slop_icons.c
 FONT    := libslop/font_data.h
 
 SHELL_BIN := $(BIN)/slop-shell
 INIT_BIN  := $(ROOT)/init
-APPS := files term image view about open
+APPS := files term image view about open calc monitor settings notes
 APP_BINS := $(addprefix $(BIN)/slop-,$(APPS))
 COMPAT_BIN := $(BIN)/slop-launch
+XSESSION_BIN := $(BIN)/slop-xsession
+
+# slop-xsession is part of the compatibility world (it speaks X11), so unlike
+# the native apps it is dynamically linked and links Xlib/XTest.
+X11_CFLAGS := $(shell pkg-config --cflags x11 xtst 2>/dev/null)
+X11_LIBS   := $(shell pkg-config --libs x11 xtst 2>/dev/null || echo -lX11 -lXtst)
 
 .PHONY: all kernel user image iso run clean fonts shots
 
@@ -45,7 +51,7 @@ $(SHELL_BIN): shell/shell.c $(LIBSLOP) libslop/slop.h $(FONT)
 
 $(INIT_BIN): init/init.c $(LIBSLOP) libslop/slop.h $(FONT)
 	@mkdir -p $(ROOT)
-	$(CC) $(CFLAGS) $(LDFLAGS) init/init.c $(LIBSLOP) -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) init/init.c $(LIBSLOP) -o $@ $(LDLIBS)
 
 $(BIN)/slop-%: apps/%.c $(LIBSLOP) libslop/slop.h $(FONT)
 	@mkdir -p $(BIN)
@@ -55,7 +61,11 @@ $(COMPAT_BIN): compat/slop-launch.c $(LIBSLOP) libslop/slop.h $(FONT)
 	@mkdir -p $(BIN)
 	$(CC) $(CFLAGS) $(LDFLAGS) compat/slop-launch.c $(LIBSLOP) -o $@ $(LDLIBS)
 
-user: $(INIT_BIN) $(SHELL_BIN) $(APP_BINS) $(COMPAT_BIN)
+$(XSESSION_BIN): compat/xsession.c $(LIBSLOP) libslop/slop.h $(FONT)
+	@mkdir -p $(BIN)
+	$(CC) $(CFLAGS) $(X11_CFLAGS) compat/xsession.c $(LIBSLOP) -o $@ $(X11_LIBS) $(LDLIBS)
+
+user: $(INIT_BIN) $(SHELL_BIN) $(APP_BINS) $(COMPAT_BIN) $(XSESSION_BIN)
 	@echo ">> userland built"
 
 kernel:
@@ -74,17 +84,21 @@ run: iso
 	./tools/run-qemu.sh
 
 # Boot once per app and capture the framebuffer (needs a working qemu + Pillow).
+# Apps are opened by clicking their dock icon, which also exercises the shell's
+# hit-testing and launch path rather than only the keyboard shortcuts.
+DOCK_X := 299 361 423 485 547 609 671 733 795 857 919 981
+SHOT_NAMES := files term image view zen obs resolve calc monitor settings notes about
 shots: iso
 	@mkdir -p dist
-	python3 tools/screenshot.py dist/splash_5.png --wait 5
-	python3 tools/screenshot.py dist/boot.png  --wait 20
-	python3 tools/screenshot.py dist/launcher.png --wait 20 --keys m --post-wait 3
-	python3 tools/screenshot.py dist/files.png --wait 20 --keys 1 --post-wait 4
-	python3 tools/screenshot.py dist/term2.png --wait 20 --keys 2 --post-wait 5
-	python3 tools/screenshot.py dist/image.png --wait 20 --keys 3 --post-wait 4
-	python3 tools/screenshot.py dist/view.png  --wait 20 --keys 4 --post-wait 4
-	python3 tools/screenshot.py dist/about.png --wait 20 --keys 8 --post-wait 4
-	python3 tools/screenshot.py dist/compat.png --wait 20 --keys 5 --post-wait 5
+	python3 tools/screenshot.py dist/shot-boot.png --wait 6 --post-wait 0.5
+	python3 tools/screenshot.py dist/shot-desktop.png --wait 20 --post-wait 1
+	python3 tools/screenshot.py dist/shot-launcher.png --wait 20 --keys m --post-wait 2
+	@i=0; for a in $(SHOT_NAMES); do \
+	  x=$$(echo $(DOCK_X) | cut -d' ' -f$$((i+1))); \
+	  echo ">> shot $$a (dock x=$$x)"; \
+	  python3 tools/screenshot.py dist/shot-$$a.png --wait 20 --click $$x,755 --post-wait 5; \
+	  i=$$((i+1)); \
+	done
 	python3 tools/montage.py
 
 # Prove the third-party launch path with a dynamic stand-in (see the script).
@@ -92,6 +106,10 @@ verify-compat: iso
 	./tools/verify-compat.sh zen
 	./tools/verify-compat.sh obs
 	./tools/verify-compat.sh resolve
+
+# Prove the real X11 path: a genuine X client renders into a SlopOS window.
+verify-x11: iso
+	./tools/verify-x11.sh
 
 clean:
 	rm -rf $(DIST) $(BIN) libslop/*.o

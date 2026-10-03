@@ -45,6 +45,8 @@ def main():
     ap.add_argument("--post-wait", type=float, default=0.0)
     ap.add_argument("--keys", nargs="*", default=[])
     ap.add_argument("--cmd", action="append", default=[])
+    ap.add_argument("--click", action="append", default=[],
+                    help="X,Y to left-click (may be given more than once)")
     ap.add_argument("--mem", default="2048")
     ap.add_argument("--smp", default="2")
     ap.add_argument("--iso", default=ISO)
@@ -83,6 +85,16 @@ def main():
     for c in args.cmd:
         print(">>", c)
         mon.cmd(c)
+    # QEMU's monitor mouse_move is relative, and the guest cursor starts at
+    # the centre of the screen, so track position and send deltas.
+    cx, cy = 640, 400
+    for c in args.click:
+        x, y = (int(v) for v in c.split(","))
+        print(f">> click {x},{y}")
+        mon.cmd(f"mouse_move {x - cx} {y - cy}", wait=0.2)
+        cx, cy = x, y
+        mon.cmd("mouse_button 1", wait=0.15)
+        mon.cmd("mouse_button 0", wait=0.3)
 
     if args.post_wait:
         time.sleep(args.post_wait)

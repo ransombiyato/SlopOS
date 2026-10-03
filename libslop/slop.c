@@ -14,16 +14,277 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <linux/fb.h>
 #include <linux/input.h>
+#include <math.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO
 #define STBI_NO_HDR
 #define STBI_NO_LINEAR
 #include "../third_party/stb_image.h"
+#include "slop_proto.h"
 
 slop_display slop;
+
+/* Input device handles. Declared early because slop_open_window() releases
+   them when the compositor takes over, even though they are opened later. */
+static int kbd_fd = -1;
+static int mouse_fds[4]; static int mouse_n = 0;
+
+/* ---------------------------------------------------- compositor plumbing */
+static uint32_t *comp_surface = NULL;   /* memfd-backed surface we share */
+static size_t    comp_surface_size = 0;
+static int       comp_surface_fd = -1;
+static int       comp_pending_resize = 0;
+static int       comp_close_requested = 0;
+
+/* pending input events translated from the compositor, drained by slop_poll */
+#define COMP_QMAX 256
+static slop_event comp_q[COMP_QMAX];
+static int comp_qh = 0, comp_qt = 0;
+static void comp_qpush(const slop_event *e) {
+    int n = (comp_qt + 1) % COMP_QMAX;
+    if (n == comp_qh) return;   /* full: drop */
+    comp_q[comp_qt] = *e;
+    comp_qt = n;
+}
+
+int slop_send_fd(int sock, int fd) {
+    struct msghdr msg = {0};
+    char buf[1] = {'F'};
+    struct iovec io = { .iov_base = buf, .iov_len = 1 };
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    memset(cbuf, 0, sizeof(cbuf));
+    msg.msg_iov = &io; msg.msg_iovlen = 1;
+    msg.msg_control = cbuf; msg.msg_controllen = sizeof(cbuf);
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &fd, sizeof(int));
+    return sendmsg(sock, &msg, 0) >= 0 ? 0 : -1;
+}
+int slop_recv_fd(int sock, int *out_fd) {
+    struct msghdr msg = {0};
+    char buf[1];
+    struct iovec io = { .iov_base = buf, .iov_len = 1 };
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    msg.msg_iov = &io; msg.msg_iovlen = 1;
+    msg.msg_control = cbuf; msg.msg_controllen = sizeof(cbuf);
+    if (recvmsg(sock, &msg, 0) <= 0) return -1;
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    if (cm && cm->cmsg_type == SCM_RIGHTS) {
+        memcpy(out_fd, CMSG_DATA(cm), sizeof(int));
+        return 0;
+    }
+    return -1;
+}
+int slop_send_msg(int sock, const slop_msg *m) {
+    return write(sock, m, sizeof(*m)) == (ssize_t)sizeof(*m) ? 0 : -1;
+}
+/* Send a message with a file descriptor attached to it (SCM_RIGHTS). One
+   sendmsg call, so the fd arrives exactly with this message. */
+int slop_send_msg_fd(int sock, const slop_msg *m, int fd) {
+    struct msghdr msg = {0};
+    struct iovec io = { .iov_base = (void *)m, .iov_len = sizeof(*m) };
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    memset(cbuf, 0, sizeof(cbuf));
+    msg.msg_iov = &io; msg.msg_iovlen = 1;
+    msg.msg_control = cbuf; msg.msg_controllen = sizeof(cbuf);
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &fd, sizeof(int));
+    return sendmsg(sock, &msg, 0) >= 0 ? 0 : -1;
+}
+/* Receive one message, optionally with an fd. */
+int slop_recv_msg(int sock, slop_msg *m, int *fd_out) {
+    struct msghdr msg = {0};
+    struct iovec io = { .iov_base = m, .iov_len = sizeof(*m) };
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    msg.msg_iov = &io; msg.msg_iovlen = 1;
+    msg.msg_control = cbuf; msg.msg_controllen = sizeof(cbuf);
+    ssize_t r = recvmsg(sock, &msg, 0);
+    if (r <= 0) return (int)r;
+    if (fd_out) {
+        *fd_out = -1;
+        struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+        if (cm && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS)
+            memcpy(fd_out, CMSG_DATA(cm), sizeof(int));
+    }
+    return (int)r;
+}
+
+/* Allocate a memfd surface of w*h and map it as our drawing target. */
+static int comp_alloc_surface(int w, int h) {
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    /* slop.back may currently be the framebuffer backbuffer (malloc'd) or the
+       previous compositor surface (mmap'd); release whichever it is. */
+    if (slop.back && slop.back != comp_surface) free(slop.back);
+    slop.back = NULL;
+    if (comp_surface) { munmap(comp_surface, comp_surface_size); comp_surface = NULL; }
+    if (comp_surface_fd >= 0) { close(comp_surface_fd); comp_surface_fd = -1; }
+
+    comp_surface_fd = memfd_create("slop-surface", MFD_CLOEXEC);
+    if (comp_surface_fd < 0) return -1;
+    comp_surface_size = (size_t)w * h * 4;
+    if (ftruncate(comp_surface_fd, (off_t)comp_surface_size) < 0) return -1;
+    comp_surface = mmap(NULL, comp_surface_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, comp_surface_fd, 0);
+    if (comp_surface == MAP_FAILED) { comp_surface = NULL; return -1; }
+
+    slop.back = comp_surface;
+    slop.w = w; slop.h = h;
+    slop.surface_w = w; slop.surface_h = h;
+    return 0;
+}
+
+int slop_open_window(const char *title, int icon) {
+    if (slop.composited) return 0;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un sa = {0};
+    sa.sun_family = AF_UNIX;
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", SLOP_COMPOSITOR_SOCK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return -1; }
+
+    slop_msg m = {0};
+    m.type = SLOP_MSG_HELLO; m.magic = SLOP_PROTO_MAGIC; m.version = SLOP_PROTO_VERSION;
+    m.icon = icon;
+    if (title) snprintf(m.title, sizeof(m.title), "%s", title);
+    if (slop_send_msg(fd, &m) < 0) { close(fd); return -1; }
+
+    /* Blocking read for WELCOME. */
+    slop_msg w = {0};
+    ssize_t r = read(fd, &w, sizeof(w));
+    if (r != (ssize_t)sizeof(w) || w.type != SLOP_MSG_WELCOME) { close(fd); return -1; }
+
+    slop.sock = fd;
+    slop.win_id = w.id;
+    slop.focused = w.focused;
+    if (comp_alloc_surface(w.w, w.h) < 0) { close(fd); slop.sock = -1; return -1; }
+
+    /* Hand the compositor the surface fd, attached to the HELLO-acknowledged
+       SURFACE message so it is unambiguous. */
+    slop_msg s = {0};
+    s.type = SLOP_MSG_SURFACE; s.magic = SLOP_PROTO_MAGIC; s.w = slop.w; s.h = slop.h;
+    if (slop_send_msg_fd(fd, &s, comp_surface_fd) < 0) { close(fd); slop.sock = -1; return -1; }
+
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    slop.composited = 1;
+    slop.scale = 1;
+    slop.mouse_x = slop.w / 2; slop.mouse_y = slop.h / 2;
+
+    /* The compositor now owns the screen and the input devices. If slop_init()
+       had opened them (because the app started life as a fullscreen client),
+       release them so we do not steal events from the compositor. */
+    if (kbd_fd >= 0) { close(kbd_fd); kbd_fd = -1; }
+    for (int i = 0; i < mouse_n; i++) close(mouse_fds[i]);
+    mouse_n = 0;
+    if (slop.fb && slop.fb != MAP_FAILED) { munmap(slop.fb, slop.size); }
+    slop.fb = NULL;
+    if (slop.fd >= 0) { close(slop.fd); slop.fd = -1; }
+    return 0;
+}
+
+int slop_app_start(const char *title, int icon) {
+    /* Prefer a real compositor window; if the shell is not running we just draw
+       to the framebuffer ourselves, which is what the recovery console does. */
+    if (slop_open_window(title, icon) == 0) return 0;
+    if (slop_init() == 0) return 0;
+    return -1;
+}
+
+int  slop_composited(void) { return slop.composited; }
+int  slop_window_focused(void) { return slop.focused; }
+void slop_set_icon(int icon) {
+    if (!slop.composited) return;
+    slop_msg m = {0};
+    m.type = SLOP_MSG_SET_ICON; m.magic = SLOP_PROTO_MAGIC; m.icon = icon;
+    slop_send_msg(slop.sock, &m);
+}
+void slop_set_title(const char *title) {
+    if (!slop.composited) return;
+    slop_msg m = {0};
+    m.type = SLOP_MSG_SET_TITLE; m.magic = SLOP_PROTO_MAGIC;
+    if (title) snprintf(m.title, sizeof(m.title), "%s", title);
+    slop_send_msg(slop.sock, &m);
+}
+int slop_window_resized(void) {
+    if (comp_pending_resize) { comp_pending_resize = 0; return 1; }
+    return 0;
+}
+void slop_request_close(void) { comp_close_requested = 1; }
+
+/* Drain the compositor socket: control messages + input, translated. */
+static void comp_pump(void) {
+    if (!slop.composited) return;
+    slop_msg m;
+    for (;;) {
+        ssize_t r = read(slop.sock, &m, sizeof(m));
+        if (r != (ssize_t)sizeof(m)) break;
+        if (m.magic != SLOP_PROTO_MAGIC) continue;
+        switch (m.type) {
+        case SLOP_MSG_CONFIGURE:
+            if (m.w != slop.w || m.h != slop.h) {
+                if (comp_alloc_surface(m.w, m.h) == 0) {
+                    comp_pending_resize = 1;
+                    slop_msg s = {0};
+                    s.type = SLOP_MSG_SURFACE; s.magic = SLOP_PROTO_MAGIC;
+                    s.w = slop.w; s.h = slop.h;
+                    slop_send_msg_fd(slop.sock, &s, comp_surface_fd);
+                }
+            }
+            break;
+        case SLOP_MSG_FOCUS:
+            slop.focused = m.focused;
+            break;
+        case SLOP_MSG_CLOSE:
+            comp_close_requested = 1;
+            break;
+        case SLOP_MSG_EVENT: {
+            slop_event e; memset(&e, 0, sizeof(e));
+            switch (m.kind) {
+            case SLOP_PEV_MOTION:
+                slop.mouse_x = m.x; slop.mouse_y = m.y;
+                e.type = SLOP_EV_MOUSE_MOVE; e.x = m.x; e.y = m.y;
+                break;
+            case SLOP_PEV_BUTTON_DOWN:
+                slop.mouse_x = m.x; slop.mouse_y = m.y;
+                e.type = SLOP_EV_MOUSE_DOWN; e.button = m.button;
+                break;
+            case SLOP_PEV_BUTTON_UP:
+                slop.mouse_x = m.x; slop.mouse_y = m.y;
+                e.type = SLOP_EV_MOUSE_UP; e.button = m.button;
+                break;
+            case SLOP_PEV_WHEEL:
+                slop.mouse_x = m.x; slop.mouse_y = m.y;
+                e.type = SLOP_EV_WHEEL; e.wheel = m.wheel; e.x = m.x; e.y = m.y;
+                break;
+            case SLOP_PEV_KEY:
+                e.type = SLOP_EV_KEY; e.code = (uint16_t)m.code;
+                e.key = m.key; e.mods = m.mods; e.x = m.x; e.y = m.y;
+                break;
+            case SLOP_PEV_TEXT:
+                e.type = SLOP_EV_KEY; e.ch = (char)m.ch; e.mods = m.mods;
+                e.x = m.x; e.y = m.y;
+                break;
+            default: continue;
+            }
+            comp_qpush(&e);
+            break;
+        }
+        default: break;
+        }
+    }
+}
 
 /* ================================================================= theme */
 const slop_theme slop_theme_dark = {
@@ -323,6 +584,12 @@ void slop_image_draw_scaled(const slop_image *img, int x, int y, int w, int h) {
 
 /* ================================================================ present */
 void slop_present(void) {
+    if (slop.composited) {
+        slop_msg m = {0};
+        m.type = SLOP_MSG_FRAME; m.magic = SLOP_PROTO_MAGIC;
+        slop_send_msg(slop.sock, &m);
+        return;
+    }
     if (!slop.fb) return;
     if (slop.bpp == 32) {
         for (int y = 0; y < slop.h; y++) {
@@ -343,8 +610,6 @@ void slop_present(void) {
 }
 
 /* ================================================================ input */
-static int kbd_fd = -1;
-static int mouse_fds[4]; static int mouse_n = 0;
 static int abs_min_x, abs_max_x, abs_min_y, abs_max_y;
 static int shift_down = 0, ctrl_down = 0, alt_down = 0;
 
@@ -502,6 +767,12 @@ static int pump_one(slop_event *e) {
 }
 
 int slop_poll(slop_event *e) {
+    if (slop.composited) comp_pump();
+    if (comp_qh != comp_qt) {
+        *e = comp_q[comp_qh];
+        comp_qh = (comp_qh + 1) % COMP_QMAX;
+        return 1;
+    }
     memset(e, 0, sizeof(*e));
     return pump_one(e);
 }
@@ -519,6 +790,7 @@ void slop_flush_events(void) { slop_event e; while (slop_poll(&e)) {} }
 void slop_set_cursor(int x, int y) { slop.mouse_x = x; slop.mouse_y = y; }
 
 void slop_draw_cursor(void) {
+    if (slop.composited) return;   /* the compositor draws the cursor */
     int x = slop.mouse_x, y = slop.mouse_y;
     static const char *shape[] = {
         "X          ", "XX         ", "X.X        ", "X..X       ",
@@ -565,15 +837,30 @@ int slop_init(void) {
     return 0;
 }
 void slop_shutdown(void) {
-    if (slop.back) { free(slop.back); slop.back = NULL; }
+    if (slop.composited && slop.sock >= 0) {
+        slop_msg m = {0};
+        m.type = SLOP_MSG_BYE; m.magic = SLOP_PROTO_MAGIC;
+        slop_send_msg(slop.sock, &m);
+        close(slop.sock);
+    }
+    slop.sock = -1;
+    slop.composited = 0;
+    if (slop.back && slop.back != comp_surface) free(slop.back);
+    slop.back = NULL;
+    if (comp_surface) { munmap(comp_surface, comp_surface_size); comp_surface = NULL; }
+    if (comp_surface_fd >= 0) { close(comp_surface_fd); comp_surface_fd = -1; }
     if (slop.fb && slop.fb != MAP_FAILED) munmap(slop.fb, slop.size);
+    slop.fb = NULL;
     if (slop.fd >= 0) close(slop.fd);
-    if (kbd_fd >= 0) close(kbd_fd);
+    slop.fd = -1;
+    if (kbd_fd >= 0) { close(kbd_fd); kbd_fd = -1; }
     for (int i = 0; i < mouse_n; i++) close(mouse_fds[i]);
+    mouse_n = 0;
 }
 
 /* ======================================================== immediate frame */
 slop_input ui;
+void (*slop_event_hook)(const slop_event *e) = NULL;
 static int prev_left_down = 0, prev_right_down = 0;
 static int last_frame_ms = 0;
 
@@ -592,6 +879,7 @@ void slop_begin_frame(void) {
 
     slop_event e;
     while (slop_poll(&e)) {
+        if (slop_event_hook) slop_event_hook(&e);
         switch (e.type) {
         case SLOP_EV_MOUSE_DOWN:
             if (e.button == 0) ui.down = 1;
@@ -632,6 +920,7 @@ void slop_begin_frame(void) {
     prev_right_down = ui.rdown;
     ui.mx = slop.mouse_x;
     ui.my = slop.mouse_y;
+    if (comp_close_requested) { ui.quit = 1; comp_close_requested = 0; }
     clip_reset();
 }
 
@@ -812,6 +1101,14 @@ slop_chrome slop_window(const char *title, const char *subtitle, int close_hot) 
     int pad = 24;
     c.x = pad; c.y = pad;
     c.w = slop.w - 2 * pad; c.h = slop.h - 2 * pad;
+    if (slop.composited) {
+        /* The shell already draws the title bar, traffic lights and shadow, so
+           the app only fills its client area. The close button asks the shell
+           to close the window. */
+        c.x = 0; c.y = 0; c.w = slop.w; c.h = slop.h;
+        if (close_hot) slop_request_close();
+        return c;
+    }
     /* backdrop */
     slop_fill_round(c.x - 6, c.y - 6, c.w + 12, c.h + 12, 18, slop_theme_dark.titlebar_focus);
     slop_round_outline(c.x - 6, c.y - 6, c.w + 12, c.h + 12, 18, 1, slop_theme_dark.border_hi);
@@ -853,4 +1150,232 @@ void slop_human_size(long bytes, char *out, int cap) {
     while (v >= 1024.0 && i < 4) { v /= 1024.0; i++; }
     if (i == 0) snprintf(out, cap, "%ld %s", bytes, u[i]);
     else snprintf(out, cap, "%.1f %s", v, u[i]);
+}
+
+/* ======================================================== animation utils */
+float slop_ease_out_cubic(float t) {
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    float u = 1 - t;
+    return 1 - u * u * u;
+}
+float slop_ease_in_out(float t) {
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    return t < 0.5f ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t);
+}
+float slop_approach(float cur, float target, float dt_ms, float speed) {
+    if (speed <= 0) return target;
+    float k = 1.0f - expf(-speed * dt_ms / 1000.0f);
+    return cur + (target - cur) * k;
+}
+float slop_pulse(int period_ms) {
+    if (period_ms <= 0) return 0;
+    float p = (float)(slop_ticks_ms() % period_ms) / (float)period_ms;
+    return 0.5f - 0.5f * cosf(p * 6.2831853f);
+}
+
+/* ============================================================ new widgets */
+int slop_toggle(int x, int y, int *value) {
+    int w = 44, h = 24, r = h / 2;
+    int hot = in_rect(ui.mx, ui.my, x, y, w, h);
+    int clicked = 0;
+    if (hot && ui.released) { *value = !*value; clicked = 1; }
+    slop_color track = *value ? slop_theme_dark.accent
+                              : (hot ? slop_theme_dark.border_hi : slop_theme_dark.surface_lo);
+    slop_fill_round(x, y, w, h, r, track);
+    slop_round_outline(x, y, w, h, r, 1, slop_theme_dark.border);
+    int kx = *value ? x + w - h : x;
+    slop_fill_circle(kx + r, y + r, r - 3, SLOP_RGB(0xf4, 0xf6, 0xfa));
+    return clicked;
+}
+
+int slop_slider(int x, int y, int w, int *value, int lo, int hi, const char *label) {
+    int h = 6, cy = y + 10;
+    int hot = in_rect(ui.mx, ui.my, x, y - 6, w, 32);
+    if (ui.down && hot) {
+        int rel = ui.mx - x;
+        if (rel < 0) rel = 0;
+        if (rel > w) rel = w;
+        *value = lo + (hi - lo) * rel / (w ? w : 1);
+    }
+    slop_fill_round(x, cy - h / 2, w, h, h / 2, slop_theme_dark.surface_lo);
+    int frac = (hi > lo) ? (*value - lo) * w / (hi - lo) : 0;
+    slop_fill_round(x, cy - h / 2, frac, h, h / 2, slop_theme_dark.accent);
+    int kx = x + frac;
+    slop_fill_circle(kx, cy, hot ? 9 : 8, SLOP_RGB(0xf4, 0xf6, 0xfa));
+    slop_circle(kx, cy, hot ? 9 : 8, slop_theme_dark.border_hi);
+    if (label) slop_text(&slop_font_small, x, y - 8, label, slop_theme_dark.text_dim);
+    return hot && ui.down;
+}
+
+int slop_segmented(int x, int y, int w, int h, const char *const *opts, int n, int *sel) {
+    if (n <= 0) return 0;
+    slop_fill_round(x, y, w, h, 8, slop_theme_dark.surface_lo);
+    slop_round_outline(x, y, w, h, 8, 1, slop_theme_dark.border);
+    int seg = w / n, clicked = 0;
+    for (int i = 0; i < n; i++) {
+        int sx = x + i * seg, sw = (i == n - 1) ? w - i * seg : seg;
+        int hot = in_rect(ui.mx, ui.my, sx, y, sw, h);
+        if (*sel == i) slop_fill_round(sx + 2, y + 2, sw - 4, h - 4, 6, slop_theme_dark.accent);
+        else if (hot) slop_fill_round(sx + 2, y + 2, sw - 4, h - 4, 6, slop_theme_dark.surface_hi);
+        int tw = slop_text_w(&slop_font_body, opts[i]);
+        slop_text_vcenter(&slop_font_body, sx + (sw - tw) / 2, y, h, opts[i],
+                          *sel == i ? SLOP_RGB(255, 255, 255) : slop_theme_dark.text_dim);
+        if (hot && ui.released && *sel != i) { *sel = i; clicked = 1; }
+    }
+    return clicked;
+}
+
+int slop_ctx_menu(int x, int y, const char *const *items, int n, int *chosen) {
+    int row = 30, pad = 6;
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        int tw = slop_text_w(&slop_font_body, items[i]) + 48;
+        if (tw > w) w = tw;
+    }
+    if (w < 160) w = 160;
+    int h = n * row + pad * 2;
+    if (x + w > slop.w) x = slop.w - w - 6;
+    if (y + h > slop.h) y = slop.h - h - 6;
+    if (x < 6) x = 6;
+    if (y < 6) y = 6;
+    slop_shadow(x, y, w, h, 14, 90);
+    slop_fill_round(x, y, w, h, 10, slop_theme_dark.surface_hi);
+    slop_round_outline(x, y, w, h, 10, 1, slop_theme_dark.border_hi);
+    int result = -1;
+    for (int i = 0; i < n; i++) {
+        int ry = y + pad + i * row;
+        int hot = in_rect(ui.mx, ui.my, x, ry, w, row);
+        if (hot) slop_fill_round(x + 4, ry, w - 8, row, 6, slop_theme_dark.accent);
+        slop_text_vcenter(&slop_font_body, x + 16, ry, row, items[i],
+                          hot ? SLOP_RGB(255, 255, 255) : slop_theme_dark.text);
+        if (hot && ui.released) result = i;
+    }
+    if (chosen) *chosen = result;
+    return result;
+}
+
+int slop_tab_bar(int x, int y, int w, int h, char labels[][32], int n, int *active,
+                 int *close_clicked) {
+    int clicked = 0;
+    if (close_clicked) *close_clicked = -1;
+    int x0 = x;
+    for (int i = 0; i < n; i++) {
+        int tw = slop_text_w(&slop_font_body, labels[i]) + 40;
+        if (tw < 110) tw = 110;
+        if (x0 + tw > x + w) { tw = x + w - x0;
+        if (tw < 40) break; }
+        int hot = in_rect(ui.mx, ui.my, x0, y, tw, h);
+        slop_color bg = (*active == i) ? slop_theme_dark.surface_hi
+                                       : (hot ? slop_theme_dark.surface : slop_theme_dark.surface_lo);
+        slop_fill_round(x0, y, tw - 4, h, 8, bg);
+        if (*active == i) slop_round_outline(x0, y, tw - 4, h, 8, 1, slop_theme_dark.border_hi);
+        slop_text_vcenter(&slop_font_body, x0 + 12, y, h, labels[i],
+                          *active == i ? slop_theme_dark.text : slop_theme_dark.text_dim);
+        int bx = x0 + tw - 26, by = y + h / 2;
+        int xhot = in_rect(ui.mx, ui.my, bx - 8, by - 8, 16, 16);
+        if (hot || *active == i) {
+            slop_color cc = xhot ? slop_theme_dark.bad : slop_theme_dark.text_mute;
+            slop_line(bx - 4, by - 4, bx + 4, by + 4, cc);
+            slop_line(bx + 4, by - 4, bx - 4, by + 4, cc);
+        }
+        if (hot && ui.released) {
+            if (xhot && close_clicked) { *close_clicked = i; clicked = 1; }
+            else if (*active != i) { *active = i; clicked = 1; }
+        }
+        x0 += tw - 2;
+    }
+    return clicked;
+}
+
+int slop_card(int x, int y, int w, int h, const char *title, const char *subtitle) {
+    slop_fill_round(x, y, w, h, 12, slop_theme_dark.surface);
+    slop_round_outline(x, y, w, h, 12, 1, slop_theme_dark.border);
+    if (title) slop_text_vcenter(&slop_font_bold, x + 16, y, 40, title, slop_theme_dark.text);
+    if (subtitle) slop_text_vcenter(&slop_font_small, x + 16 + slop_text_w(&slop_font_bold, title) + 12,
+                                    y, 40, subtitle, slop_theme_dark.text_mute);
+    return in_rect(ui.mx, ui.my, x, y, w, h);
+}
+
+void slop_stat_row(int x, int y, int w, const char *label, const char *value,
+                   slop_color value_col) {
+    slop_text_vcenter(&slop_font_body, x, y, 30, label, slop_theme_dark.text_dim);
+    int vw = slop_text_w(&slop_font_bold, value);
+    slop_text_vcenter(&slop_font_bold, x + w - vw, y, 30, value, value_col);
+    slop_hline(x, y + 30, w, slop_theme_dark.border);
+}
+
+int slop_search_box(int x, int y, int w, int h, char *buf, int cap, int *cursor, int *focused) {
+    int r = slop_textfield(x, y, w, h, buf, cap, cursor, focused, "Search...");
+    int gx = x + 12, gy = y + h / 2;
+    slop_circle(gx, gy - 1, 5, slop_theme_dark.text_mute);
+    slop_line(gx + 3, gy + 2, gx + 7, gy + 6, slop_theme_dark.text_mute);
+    return r;
+}
+
+void slop_tooltip(const char *text) {
+    if (!text || !*text) return;
+    int tw = slop_text_w(&slop_font_small, text);
+    int w = tw + 18, h = 26;
+    int x = ui.mx + 16, y = ui.my + 18;
+    if (x + w > slop.w) x = slop.w - w - 4;
+    if (y + h > slop.h) y = ui.my - h - 8;
+    slop_fill_round(x, y, w, h, 6, SLOP_RGB(0x24, 0x29, 0x38));
+    slop_round_outline(x, y, w, h, 6, 1, slop_theme_dark.border_hi);
+    slop_text_vcenter(&slop_font_small, x + 9, y, h, text, slop_theme_dark.text);
+}
+
+void slop_spinner(int cx, int cy, int r, slop_color col) {
+    float p = slop_pulse(900) * 6.2831853f;
+    for (int i = 0; i < 8; i++) {
+        float a = p + i * 0.7853982f;
+        int x = cx + (int)(cosf(a) * r), y = cy + (int)(sinf(a) * r);
+        int alpha = 40 + (i * 200 / 8);
+        slop_blend(x, y, col, alpha);
+        slop_blend(x + 1, y, col, alpha);
+        slop_blend(x, y + 1, col, alpha);
+    }
+}
+
+void slop_ring_gauge(int cx, int cy, int r, int pct, slop_color col, const char *label) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    for (int a = 0; a < 360; a += 2) {
+        float rad = a * 3.14159265f / 180.0f;
+        int x = cx + (int)(cosf(rad) * r), y = cy + (int)(sinf(rad) * r);
+        slop_blend(x, y, slop_theme_dark.surface_lo, 255);
+        slop_blend(x + 1, y, slop_theme_dark.surface_lo, 255);
+    }
+    int sweep = pct * 360 / 100;
+    for (int a = -90; a < -90 + sweep; a += 2) {
+        float rad = a * 3.14159265f / 180.0f;
+        int x = cx + (int)(cosf(rad) * r), y = cy + (int)(sinf(rad) * r);
+        slop_blend(x, y, col, 255);
+        slop_blend(x + 1, y, col, 255);
+        slop_blend(x, y + 1, col, 255);
+    }
+    if (label) {
+        int lw = slop_text_w(&slop_font_bold, label);
+        slop_text(&slop_font_bold, cx - lw / 2, cy + 4, label, slop_theme_dark.text);
+    }
+}
+
+void slop_bar_gauge(int x, int y, int w, int h, int pct, slop_color col) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    slop_fill_round(x, y, w, h, h / 2, slop_theme_dark.surface_lo);
+    slop_fill_round(x, y, w * pct / 100, h, h / 2, col);
+}
+
+int slop_close_button(int x, int y, int s, int hot_state) {
+    (void)hot_state;
+    int hot = in_rect(ui.mx, ui.my, x, y, s, s);
+    slop_fill_circle(x + s / 2, y + s / 2, s / 2, hot ? SLOP_RGB(0xff, 0x6b, 0x63)
+                                                      : SLOP_RGB(0xff, 0x5f, 0x57));
+    slop_color g = SLOP_RGB(0x5a, 0x14, 0x10);
+    int c = s / 2;
+    slop_line(x + c - 3, y + c - 3, x + c + 3, y + c + 3, g);
+    slop_line(x + c + 3, y + c - 3, x + c - 3, y + c + 3, g);
+    return hot && ui.released;
 }

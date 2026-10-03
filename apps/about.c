@@ -6,6 +6,7 @@
  */
 #define _GNU_SOURCE
 #include "../libslop/slop.h"
+#include "../libslop/slop_icons.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +31,7 @@ static void row(int x, int y, int w, const char *label, const char *value) {
 }
 
 int main(void) {
-    if (slop_init() != 0) { fprintf(stderr, "slop-about: no framebuffer\n"); return 1; }
+    if (slop_app_start("System Info", SLOP_ICON_ABOUT) != 0) { fprintf(stderr, "slop-about: no display\n"); return 1; }
     slop_flush_events();
 
     struct utsname u;

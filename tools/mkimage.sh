@@ -16,7 +16,7 @@ mkdir -p "$ROOT"/etc/OpenCL/vendors
 # init and native apps are placed by make; verify they exist
 for f in init usr/bin/slop-shell usr/bin/slop-files usr/bin/slop-term \
          usr/bin/slop-image usr/bin/slop-view usr/bin/slop-about \
-         usr/bin/slop-open usr/bin/slop-launch; do
+         usr/bin/slop-open usr/bin/slop-launch usr/bin/slop-xsession; do
   [ -x "$ROOT/$f" ] || { echo "!! missing $ROOT/$f (run 'make user')"; exit 1; }
 done
 
@@ -58,6 +58,51 @@ else
   echo "!! glibc not found; third-party apps will not be able to exec"
 fi
 
+# The real X11 stack. SlopOS runs Xvfb as the display server for third-party
+# apps; slop-launch starts it, slop-xsession turns its screen into a SlopOS
+# window and forwards input via XTEST. Without this, only the readiness screen
+# can be shown. Everything here is compatibility-world only.
+X11_BINS=""
+for b in /usr/bin/Xvfb /usr/bin/xkbcomp /usr/bin/xauth; do
+  [ -x "$b" ] && X11_BINS="$X11_BINS $b"
+done
+if [ -n "$X11_BINS" ]; then
+  for b in $X11_BINS; do cp -fL "$b" "$ROOT/usr/bin/$(basename "$b")"; done
+  python3 tools/stage-dynlibs.py "$ROOT" $X11_BINS
+  # keyboard config the X server compiles at startup
+  if [ -d /usr/share/X11/xkb ]; then
+    mkdir -p "$ROOT/usr/share/X11"
+    cp -rL /usr/share/X11/xkb "$ROOT/usr/share/X11/" 2>/dev/null || true
+  fi
+  # a minimal font set so X clients have core fonts
+  if [ -d /usr/share/fonts/X11 ]; then
+    mkdir -p "$ROOT/usr/share/fonts"
+    cp -rL /usr/share/fonts/X11 "$ROOT/usr/share/fonts/" 2>/dev/null || true
+  fi
+  mkdir -p "$ROOT/tmp/.X11-unix"
+  chmod 1777 "$ROOT/tmp"
+  echo ">> X11 display server staged for third-party apps"
+else
+  echo "!! Xvfb not found; third-party apps cannot start their display"
+fi
+
+# sample X11 clients, used by `make verify-x11` to prove the whole bridge
+# (X server -> window surface -> input) with a real program, not a stand-in.
+X11_DEMO=""
+for b in /usr/bin/xeyes /usr/bin/xclock; do
+  [ -x "$b" ] && X11_DEMO="$X11_DEMO $b"
+done
+if [ -n "$X11_DEMO" ]; then
+  for b in $X11_DEMO; do cp -fL "$b" "$ROOT/usr/bin/$(basename "$b")"; done
+  python3 tools/stage-dynlibs.py "$ROOT" $X11_DEMO
+  echo ">> X11 demo clients staged (xeyes, xclock)"
+fi
+
+# slop-xsession is dynamically linked against Xlib/XTest, so stage its own
+# dependencies as well (the Xvfb deps cover most, but be explicit).
+[ -x "$ROOT/usr/bin/slop-xsession" ] && \
+  python3 tools/stage-dynlibs.py "$ROOT" "$ROOT/usr/bin/slop-xsession"
+
 # compatibility manifests
 cp -f compat/apps/*.app "$ROOT/usr/share/slop/compat/"
 
@@ -98,7 +143,7 @@ int main(void) {
 EOF
 
 cat > "$ROOT/etc/motd" <<'EOF'
-SlopOS 0.1 -- a smooth little x86_64 desktop
+SlopOS 0.2 -- a smooth little x86_64 desktop
 EOF
 
 # sample images for the image viewer (generated at build time; needs Pillow)

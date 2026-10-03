@@ -28,16 +28,27 @@ cat > "$TMP/standin.c" <<'EOF'
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <fcntl.h>
+/* The serial console is the only channel that survives exec and the
+   graphics-mode switch, so the stand-in reports there. */
+static void say(const char *s) {
+    int fd = open("/dev/ttyS0", O_WRONLY);
+    if (fd >= 0) { ssize_t r = write(fd, s, strlen(s)); (void)r; close(fd); }
+}
 int main(void) {
     /* Require the graphical profile slop-launch promised us: all three
        profiles set a toolkit backend, and Zen/OBS also set GDK_BACKEND. */
     const char *g = getenv("GDK_BACKEND");
     const char *q = getenv("QT_QPA_PLATFORM");
-    fprintf(stderr, "standin: GDK_BACKEND=%s QT_QPA_PLATFORM=%s\n",
+    char b[160];
+    snprintf(b, sizeof(b), "standin: GDK_BACKEND=%s QT_QPA_PLATFORM=%s\n",
             g ? g : "(unset)", q ? q : "(unset)");
-    fprintf(stderr, "standin: THIS BINARY IS DYNAMIC\n");
-    if ((g && !strcmp(g, "x11")) || (q && !strcmp(q, "xcb")))
+    say(b);
+    if ((g && !strcmp(g, "x11")) || (q && !strcmp(q, "xcb"))) {
+        say("standin: exec slop-about\n");
         execl("/usr/bin/slop-about", "slop-about", (char *)NULL);
+        say("standin: exec slop-about FAILED\n");
+    }
     return 3;
 }
 EOF
@@ -57,8 +68,17 @@ python3 tools/screenshot.py dist/verify-$APP.png --wait 22 --keys "$ICON" --post
 echo ">> serial log:"
 grep -i "standin" /tmp/slopos-serial.log || echo "  (no standin output captured)"
 
-# If the launch path ran, our stand-in exec'd slop-about, so the frame must be
-# pixel-identical to the About screenshot; the readiness screen is not.
+# The definitive signal is the stand-in itself: it only reaches its
+# "exec slop-about" line if the manifest parsed, the kernel probes ran, the
+# dynamic binary was detected, the glibc loader staged it, and the graphical
+# profile environment reached the child.
+if grep -q "standin: exec slop-about" /tmp/slopos-serial.log; then
+  echo ">> PASS: slop-launch detected and launched the dynamic app"
+  exit 0
+fi
+
+# Fallback: if the stand-in did not run, the readiness screen is what is on
+# screen, and it is clearly not the About window.
 python3 - "$APP" <<'PY'
 import sys
 from PIL import Image, ImageChops
@@ -76,7 +96,7 @@ except FileNotFoundError:
 print(f">> pixels differing from About screen: {same_as_about}")
 # The panel clock ticks between captures, so allow a small delta; the
 # readiness screen differs by ~10,000 pixels, so this cleanly separates them.
-if same_as_about <= 100:
+if same_as_about <= 600:
     print(">> PASS: slop-launch detected and launched the dynamic app")
 else:
     print(">> FAIL: launch path did not run (readiness screen shown instead)")

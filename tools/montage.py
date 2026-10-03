@@ -5,16 +5,21 @@ from PIL import Image, ImageDraw
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHOTS = [
-    ("splash_5.png", "Boot splash"),
-    ("boot.png", "Desktop"),
-    ("launcher.png", "Launcher"),
-    ("files.png", "Files"),
-    ("term2.png", "Terminal"),
-    ("image.png", "Image Viewer"),
-    ("view.png", "File Viewer"),
-    ("about.png", "System Info"),
-    ("compat.png", "Compat: Zen Browser"),
-    ("resolve.png", "Compat: DaVinci Resolve"),
+    ("shot-boot.png", "Boot splash"),
+    ("shot-desktop.png", "Desktop"),
+    ("shot-launcher.png", "Launcher"),
+    ("shot-files.png", "Files"),
+    ("shot-term.png", "Terminal"),
+    ("shot-image.png", "Image Viewer"),
+    ("shot-view.png", "File Viewer"),
+    ("shot-calc.png", "Calculator"),
+    ("shot-monitor.png", "System Monitor"),
+    ("shot-settings.png", "Settings"),
+    ("shot-notes.png", "Notes"),
+    ("shot-about.png", "System Info"),
+    ("shot-zen.png", "Compat: Zen Browser"),
+    ("shot-obs.png", "Compat: OBS Studio"),
+    ("shot-resolve.png", "Compat: DaVinci Resolve"),
 ]
 
 CELL_W, CELL_H = 520, 340

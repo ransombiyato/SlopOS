@@ -19,9 +19,12 @@ make iso      # dist/slopos.iso (hybrid BIOS+UEFI)
 make run      # boot in QEMU
 make shots    # boot per app and capture dist/*.png + docs/screenshots.png
 make verify-compat   # prove the third-party launch path (dynamic stand-in)
+make verify-x11      # prove a real X client renders through a SlopOS window
 make clean
 ```
 All userland is linked `-static`; the initramfs must be self-contained.
+Exception: `compat/slop-xsession` is dynamically linked (Xlib/XTest), and its
+libs are staged by `tools/mkimage.sh` / `tools/stage-dynlibs.py`.
 
 ## Conventions
 - C11, `-Wall -Wextra`, no warnings. `_GNU_SOURCE` is defined per-source, not
@@ -43,9 +46,40 @@ All userland is linked `-static`; the initramfs must be self-contained.
 - `/dev/pts` must be mounted by `init` or the terminal has no pty.
 - `tools/verify-compat.sh APP` proves the compat *launch* path with a dynamic
   stand-in; it needs `dist/about.png` as a reference (`make shots` first).
+- `tools/verify-x11.sh` proves the real X11 path: it autostarts the `x11-demo`
+  manifest (a genuine dynamically linked xeyes) and checks the serial log plus
+  the screenshot for rendered content. See "X11 compatibility path" below.
 - A console is attached (`console=ttyS0`), but the kernel keeps it as a
   non-primary console while the fbcon is primary, so app stderr does not land
-  in the serial log. Verify launches by framebuffer, not log scraping.
+  in the serial log. `slop-launch` and `slop-xsession` therefore write their
+  own diagnostics directly to `/dev/ttyS0`. Verify launches by framebuffer
+  too, not only log scraping.
+
+## X11 compatibility path
+The three third-party apps are X11/GL/GTK programs, so the compat runtime
+brings up a real X server and bridges it into a normal SlopOS window:
+
+```
+Xvfb :1 -screen 0 758x467x24 -fbdir /run/slop/x
+      |  (XWD big-endian header, 160 bytes; XRGB8888, bpl = w*4)
+slop-xsession  -- mmaps Xvfb_screen0, blits it into its libslop surface,
+                  forwards slop_event input back via XTEST, and re-sends the
+                  window size after the compositor WELCOME
+      |  (compositor unix socket, SLOP_MSG_SURFACE shared memory)
+slop-shell     -- composites the surface into a normal window
+```
+- The shell assigns a fixed 760x500 window, so the X screen matches the 758x467
+  content area (760 - 2*BORDER, 500 - TITLEBAR_H - BORDER) for a 1:1 map.
+  A larger X screen gets centre-cropped and small clients fall off the edge.
+- `compat/xsession.c` is a libslop client, so it is compiled together with
+  `libslop/slop.c` rather than linking libslop as a library.
+- `slop-launch` relays Xvfb/xsession stderr (`/run/slop/*.err`) to the serial
+  log when the display fails to come up.
+
+## Autostart hook (testing)
+`slop-shell` reads `/run/slop/autostart`, falling back to
+`/usr/share/slop/autostart`. One line: either a dock index (`4`) or a raw
+compatibility manifest id (`x11-demo`). Used only by the verify scripts.
 
 ## Gotchas
 - GRUB config must guard BIOS-only modules (`vbe`, `video_bochs`) behind

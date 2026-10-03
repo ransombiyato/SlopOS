@@ -7,6 +7,7 @@
  */
 #define _GNU_SOURCE
 #include "../libslop/slop.h"
+#include "../libslop/slop_icons.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,7 +98,7 @@ static void draw_image_region(int cx, int cy) {
 }
 
 int main(int argc, char **argv) {
-    if (slop_init() != 0) { fprintf(stderr, "slop-image: no framebuffer\n"); return 1; }
+    if (slop_app_start("Image Viewer", SLOP_ICON_IMAGE) != 0) { fprintf(stderr, "slop-image: no display\n"); return 1; }
     const char *start = argc > 1 ? argv[1] : "/home/user/Pictures";
     struct stat st;
     if (stat(start, &st) == 0 && S_ISDIR(st.st_mode)) {

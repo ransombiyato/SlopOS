@@ -7,6 +7,7 @@
  */
 #define _GNU_SOURCE
 #include "../libslop/slop.h"
+#include "../libslop/slop_icons.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -293,7 +294,7 @@ static void on_resize(int ww, int wh) {
 }
 
 int main(void) {
-    if (slop_init() != 0) { fprintf(stderr, "slop-term: no framebuffer\n"); return 1; }
+    if (slop_app_start("Terminal", SLOP_ICON_TERM) != 0) { fprintf(stderr, "slop-term: no display\n"); return 1; }
     init_palette();
     g_cw = slop_font_mono.glyphs['M' - 32].adv;
     g_chh = slop_font_mono.height + 4;

@@ -11,6 +11,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "slop_proto.h"
 
 /* ------------------------------------------------------------------ colours */
 typedef uint32_t slop_color;
@@ -47,9 +48,50 @@ typedef struct {
     int      fd;
     int      mouse_x, mouse_y;
     int      needs_present;
+    /* compositor (windowed) state -- see slop_open_window() */
+    int      composited;   /* 1 when we are a window owned by the shell */
+    int      sock;         /* AF_UNIX connection to the compositor */
+    int      win_id;
+    int      focused;      /* 1 while the compositor considers us focused */
+    int      surface_w, surface_h;
+    int      dirty;
+    int      scale;        /* framebuffer pixels per logical pixel */
+    int      vw, vh;       /* virtual (framebuffer) size when direct */
 } slop_display;
 
 extern slop_display slop;
+
+/* ------------------------------------------------------------- windowing
+ *
+ * slop_open_window() makes the process a client of the SlopOS compositor,
+ * which is how native apps get a real, draggable window. It returns 0 when
+ * the compositor accepted us, or -1 when there is no compositor running, in
+ * which case the caller should keep using the direct framebuffer (the app
+ * still works; it just owns the whole screen).
+ *
+ * While composited, slop.w/slop.h describe the *window content* area, the
+ * coordinate origin is the window's top-left corner, and slop_present()
+ * pushes the finished frame to the shell.
+ */
+int  slop_open_window(const char *title, int icon);
+int  slop_composited(void);
+void slop_set_title(const char *title);
+
+/* The standard app opening sequence: try the compositor first (real window),
+   and fall back to the direct framebuffer only if there is no compositor.
+   Returns 0 on success. `icon` is a SLOP_ICON_* id. */
+int  slop_app_start(const char *title, int icon);
+void slop_set_icon(int icon);
+int  slop_window_resized(void);     /* consumes a pending resize notification */
+int  slop_window_focused(void);
+void slop_request_close(void);      /* ask the shell to close us */
+
+/* Low-level helpers the compositor (shell) needs; also usable by tests. */
+int  slop_send_msg(int sock, const slop_msg *m);
+int  slop_send_fd(int sock, int fd);
+int  slop_recv_fd(int sock, int *out_fd);
+int  slop_send_msg_fd(int sock, const slop_msg *m, int fd);
+int  slop_recv_msg(int sock, slop_msg *m, int *fd_out);
 
 /* ------------------------------------------------------------------- events */
 typedef enum {
@@ -136,6 +178,16 @@ void slop_set_cursor(int x, int y);
 void slop_draw_cursor(void);         /* draws arrow cursor at pointer */
 int  slop_ticks_ms(void);
 
+/* ------------------------------------------------------------- animation
+ * Small easing helpers so motion feels smooth rather than robotic.
+ */
+float slop_ease_out_cubic(float t);   /* 0..1 in, 0..1 out */
+float slop_ease_in_out(float t);
+/* Critically-damped-ish approach of `cur` toward `target`; dt in ms. */
+float slop_approach(float cur, float target, float dt_ms, float speed);
+/* Frame-rate independent 0..1 pulse that loops every `period_ms`. */
+float slop_pulse(int period_ms);
+
 /* ---------------------------------------------------- immediate-mode frame
  *
  * Apps run a simple loop:
@@ -167,6 +219,11 @@ extern slop_input ui;
 void slop_begin_frame(void);
 void slop_end_frame(void);       /* draws cursor, presents */
 
+/* Optional per-event hook, called for every raw event as the frame is drained.
+   The compositor (shell) uses this to route events to the right window; most
+   apps never touch it. Set to NULL to disable. */
+extern void (*slop_event_hook)(const slop_event *e);
+
 /* ---------------------------------------------------------------- widgets */
 typedef struct {
     int         x, y, w, h;
@@ -186,6 +243,24 @@ int  slop_textfield(int x, int y, int w, int h, char *buf, int cap, int *cursor,
 void slop_progress(int x, int y, int w, int h, int pct, slop_color col);
 void slop_badge(int x, int y, const char *text, slop_color col);
 int  slop_menuitem(int x, int y, int w, int h, const char *label, const char *shortcut);
+
+/* -------------------------------------------------------------- new widgets */
+int  slop_toggle(int x, int y, int *value);           /* iOS-style switch */
+int  slop_slider(int x, int y, int w, int *value, int lo, int hi, const char *label);
+int  slop_segmented(int x, int y, int w, int h, const char *const *opts, int n, int *sel);
+int  slop_ctx_menu(int x, int y, const char *const *items, int n, int *chosen);
+int  slop_tab_bar(int x, int y, int w, int h, char labels[][32], int n, int *active,
+                  int *close_clicked);
+int  slop_card(int x, int y, int w, int h, const char *title, const char *subtitle);
+void slop_stat_row(int x, int y, int w, const char *label, const char *value,
+                   slop_color value_col);
+int  slop_search_box(int x, int y, int w, int h, char *buf, int cap, int *cursor,
+                     int *focused);
+void slop_tooltip(const char *text);                  /* draw near the pointer */
+void slop_spinner(int cx, int cy, int r, slop_color col);
+void slop_ring_gauge(int cx, int cy, int r, int pct, slop_color col, const char *label);
+void slop_bar_gauge(int x, int y, int w, int h, int pct, slop_color col);
+int  slop_close_button(int x, int y, int s, int hot_state);  /* returns 1 clicked */
 
 /* Window chrome: draws a title bar with traffic-light buttons and returns the
  * content rectangle via out_*. */

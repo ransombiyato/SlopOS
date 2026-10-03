@@ -32,6 +32,8 @@
 #include <sys/mman.h>
 #include <sys/utsname.h>
 #include <linux/memfd.h>
+#include <stdarg.h>
+#include <sys/wait.h>
 
 /* ------------------------------------------------------------- manifest */
 typedef struct {
@@ -274,8 +276,130 @@ static void draw_readiness(const manifest *m, check_t *checks, int nchecks,
     slop_present();
 }
 
+/* --------------------------------------------------------- X11 session
+ *
+ * Zen/OBS/Resolve are X11 clients. To run them we start a real X server
+ * (Xvfb) writing its screen to a file (--fbdir), then start slop-xsession,
+ * which blits that screen into a SlopOS window and forwards input back
+ * through XTEST. The app itself then runs unmodified with DISPLAY set.
+ */
+#define SLOP_X_DISPLAY ":1"
+#define SLOP_X_FBDIR   "/run/slop/x"
+#define SLOP_X_W       758
+#define SLOP_X_H       467
+
+static int icon_for_id(const char *id) {
+    if (strstr(id, "zen")) return 5;
+    if (strstr(id, "obs")) return 6;
+    if (strstr(id, "davinci") || strstr(id, "resolve")) return 7;
+    return 0;
+}
+
+static int wait_for(const char *path, int ms) {
+    for (int t = 0; t < ms; t += 50) {
+        if (access(path, R_OK) == 0) return 0;
+        usleep(50000);
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------- serial log
+   The kernel keeps the framebuffer as the primary console, so app stderr
+   does not reach the serial port and /dev/kmsg is filtered out at
+   `quiet loglevel=3`. Opening /dev/ttyS0 and writing to it reaches the
+   serial log regardless, which is how the compatibility session is made
+   visible during a headless boot. */
+static void klog(const char *fmt, ...) {
+    int fd = open("/dev/ttyS0", O_WRONLY);
+    if (fd < 0) fd = open("/dev/kmsg", O_WRONLY);
+    if (fd < 0) return;
+    char buf[300];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ssize_t r = write(fd, buf, strlen(buf));
+    (void)r;
+    close(fd);
+}
+
+/* Echo a small file's contents to the serial log, one line, labelled. */
+static void klog_file(const char *label, const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    char buf[600];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    for (ssize_t i = 0; i < n; i++) if (buf[i] == '\n') buf[i] = ' ';
+    klog("slop-x11: %s: %.500s\n", label, buf);
+}
+
+/* Start Xvfb and the SlopOS window bridge. Returns 0 on success. */
+static int start_x_session(const manifest *m, const char *id) {
+    mkdir("/run/slop", 0755);
+    mkdir(SLOP_X_FBDIR, 0755);
+    remove(SLOP_X_FBDIR "/Xvfb_screen0");
+    klog("slop-x11: starting display server for %s\n", id);
+
+    pid_t x = fork();
+    if (x == 0) {
+        setsid();
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); }
+        /* Xvfb diagnostics go to a file we relay to the serial log if the
+           display fails to come up, so the exact X server error is visible. */
+        int ef = open("/run/slop/xvfb.err", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ef >= 0) dup2(ef, 2);
+        char size[32];
+        snprintf(size, sizeof(size), "%dx%dx24", SLOP_X_W, SLOP_X_H);
+        execl("/usr/bin/Xvfb", "Xvfb", (char *)SLOP_X_DISPLAY, "-screen", "0",
+              size, "-nolisten", "tcp", "-fbdir", (char *)SLOP_X_FBDIR, (char *)NULL);
+        _exit(127);
+    }
+    if (x < 0) return -1;
+
+    if (wait_for(SLOP_X_FBDIR "/Xvfb_screen0", 8000) != 0) {
+        klog("slop-x11: Xvfb produced no framebuffer\n");
+        klog_file("Xvfb", "/run/slop/xvfb.err");
+        return -1;
+    }
+    /* give the X server a moment to finish initialising the socket */
+    wait_for("/tmp/.X11-unix/X1", 3000);
+
+    pid_t s = fork();
+    if (s == 0) {
+        setsid();
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); }
+        int ef = open("/run/slop/xsession.err", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ef >= 0) dup2(ef, 2);
+        char sz[32], ic[16], shm[256];
+        snprintf(sz, sizeof(sz), "%dx%d", SLOP_X_W, SLOP_X_H);
+        snprintf(ic, sizeof(ic), "%d", icon_for_id(id));
+        snprintf(shm, sizeof(shm), SLOP_X_FBDIR "/Xvfb_screen0");
+        execl("/usr/bin/slop-xsession", "slop-xsession",
+              "--display", (char *)SLOP_X_DISPLAY, "--shm", shm,
+              "--size", sz, "--title", m->name, "--icon", ic, "--name", id,
+              (char *)NULL);
+        _exit(127);
+    }
+    usleep(800000);   /* let the X server and the bridge settle */
+    /* If the bridge died on startup the window will stay blank, so surface
+       the reason while we can. */
+    int st = 0;
+    if (s > 0 && waitpid(s, &st, WNOHANG) == s) {
+        klog("slop-x11: window bridge exited (status %d)\n", st);
+        klog_file("xsession", "/run/slop/xsession.err");
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *id = argc > 1 ? argv[1] : "zen";
+    klog("slop-launch: start id=%s\n", id);
     /* accept either a display name or an id; the shell passes the id */
     char key[64];
     snprintf(key, sizeof(key), "%s", id);
@@ -308,18 +432,29 @@ int main(int argc, char **argv) {
         if (m.execs[i][0] == '/' && access(m.execs[i], X_OK) == 0) { launch_path = m.execs[i]; break; }
     }
 
+    /* If the app is installed, run it for real on a genuine X server. The
+       readiness screen is only for the (uninstalled) case. */
+    if (launch_path) {
+        apply_profile(&m);
+        if (start_x_session(&m, key) != 0)
+            klog("slop-x11: display server failed for %s\n", key);
+        else
+            klog("slop-x11: display ready on %s (%dx%d)\n", SLOP_X_DISPLAY,
+                 SLOP_X_W, SLOP_X_H);
+        setenv("DISPLAY", SLOP_X_DISPLAY, 1);
+        /* Capture the app's stderr so a failed X connection is visible. */
+        int ae = open("/run/slop/app.err", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ae >= 0) dup2(ae, 2);
+        klog("slop-launch: exec %s (profile %s)\n", launch_path, m.profile);
+        execv(launch_path, (char *[]){ (char *)launch_path, NULL });
+        klog("slop-launch: exec failed: %s\n", strerror(errno));
+        return 1;
+    }
+
     int have_gui = (slop_init() == 0);
     if (have_gui) {
         slop_flush_events();
-        draw_readiness(&m, checks, nc, libs_ok, m.nlibs, tried, launch_path != NULL);
-        if (launch_path) {
-            usleep(400000);
-            slop_shutdown();
-            apply_profile(&m);
-            execl(launch_path, launch_path, (char *)NULL);
-            perror("slop-launch: exec");
-            return 1;
-        }
+        draw_readiness(&m, checks, nc, libs_ok, m.nlibs, tried, 0);
         /* wait for the user to close the readiness screen */
         for (;;) {
             slop_begin_frame();
@@ -337,6 +472,5 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nc; i++)
         printf("  [%s] %s\n", checks[i].ok ? "ok" : "!!", checks[i].label);
     printf("  libraries %d/%d, launcher: %s\n", libs_ok, m.nlibs, launch_path ? launch_path : "not installed");
-    if (launch_path) { apply_profile(&m); execl(launch_path, launch_path, (char *)NULL); }
     return 0;
 }
