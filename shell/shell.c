@@ -110,9 +110,6 @@ static int help_seen_wizard = 0;
    otherwise redraw a full-screen window blit every frame. */
 static int shell_dirty = 1;
 
-static const slop_color WALL_TOP = 0x10131f;
-static const slop_color WALL_BOT = 0x08090f;
-
 /* ============================================================== helpers */
 static int win_at(int mx, int my) {
     for (int i = MAX_WIN - 1; i >= 0; i--) {
@@ -425,10 +422,120 @@ static int frame_hit(window_t *w, int mx, int my, int *edge) {
 }
 
 /* =========================================================== desktop art */
-/* The wallpaper never changes, so it is painted once into a cached buffer and
-   blitted each frame. Redrawing the full-screen gradient plus the star dither
-   every frame dominated the frame time on software (non-KVM) machines. */
+/*
+ * "Surreal Serene Shores" -- a painted dusk seascape.
+ *
+ * The whole scene is rendered procedurally once into a cached buffer and then
+ * blitted each frame, so it costs nothing per frame. Every feature is placed
+ * from fractions of the framebuffer size, so it scales across resolutions.
+ *
+ * Colours keep a strict back-to-front value order: the sky is the brightest
+ * band, the water darkens toward the viewer, and the headlands are near-black
+ * with only a hazy rim. That ordering is what keeps window chrome, panel text
+ * and dock icons legible on top of the wallpaper.
+ */
 static slop_color *wall_cache = NULL;
+
+static inline int wall_iclamp(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* Paint a vertical stack of (position, colour) stops over the band
+   [top, top + h). `pos` is 0 at the top of the band and 1 at the bottom. */
+static void wall_vstops(int top, int h, const float *pos, const slop_color *col, int n) {
+    for (int j = 0; j < h; j++) {
+        int y = top + j;
+        if (y < 0 || y >= slop.h) continue;
+        float p = (float)j / (float)(h > 1 ? h - 1 : 1);
+        int i = 0;
+        while (i < n - 2 && p > pos[i + 1]) i++;
+        int t = (int)((p - pos[i]) / (pos[i + 1] - pos[i]) * 255.0f);
+        slop_fill_rect(0, y, slop.w, 1, slop_mix(col[i], col[i + 1], wall_iclamp(t, 0, 255)));
+    }
+}
+
+/* Soft radial glow, brightest at the centre, fading to nothing at `r`. */
+static void wall_glow(int cx, int cy, int r, slop_color col, int strength) {
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            float d = __builtin_sqrtf((float)(dx * dx + dy * dy));
+            if (d > (float)r) continue;
+            float f = 1.0f - d / (float)r;
+            int a = (int)(f * f * strength);
+            if (a > 0) slop_blend(cx + dx, cy + dy, col, a);
+        }
+    }
+}
+
+/* One cloud puff: concentric soft ellipses, the upper half tinted warm so it
+   reads as catching the last of the sun. */
+static void wall_cloud(int cx, int cy, int rw, int rh, slop_color col, int strength) {
+    for (int r = 0; r < 10; r++) {
+        int w = rw * (10 - r) / 10;
+        int h = rh * (10 - r) / 10;
+        if (w < 1 || h < 1) break;
+        int a = strength * (10 - r) / 10;
+        for (int dy = -h; dy <= h; dy++) {
+            for (int dx = -w; dx <= w; dx++) {
+                if ((int64_t)dx * dx * h * h + (int64_t)dy * dy * w * w
+                        > (int64_t)w * w * h * h)
+                    continue;
+                slop_color c = dy < 0 ? slop_mix(col, SLOP_RGB(0xff, 0xf0, 0xd8), 55) : col;
+                slop_blend(cx + dx, cy + dy, c, a);
+            }
+        }
+    }
+}
+
+/* Moon with a soft halo and a couple of darker maria. */
+static void wall_moon(int cx, int cy, int r) {
+    int hr = r * 3;
+    for (int dy = -hr; dy <= hr; dy++) {
+        for (int dx = -hr; dx <= hr; dx++) {
+            float d = __builtin_sqrtf((float)(dx * dx + dy * dy));
+            if (d > (float)hr || d <= (float)r) continue;
+            float f = 1.0f - d / (float)hr;
+            slop_blend(cx + dx, cy + dy, SLOP_RGB(0xcf, 0xd8, 0xff), (int)(f * f * 22));
+        }
+    }
+    slop_fill_circle(cx, cy, r, SLOP_RGB(0xf5, 0xf2, 0xe6));
+    slop_fill_circle(cx - r / 3, cy - r / 4, r / 5, SLOP_RGB(0xe4, 0xe0, 0xd2));
+    slop_fill_circle(cx + r / 3, cy + r / 3, r / 6, SLOP_RGB(0xe4, 0xe0, 0xd2));
+}
+
+/* A dark headland silhouette. The ridge blends toward `haze` as it rises, so
+   its tip dissolves into the sky instead of ending on a hard, pasted edge. */
+static void wall_headland(int cx, int base, float amp, float spread,
+                          slop_color col, slop_color haze) {
+    for (int x = 0; x < slop.w; x++) {
+        float d = ((float)x - (float)cx) / spread;
+        if (d < -1.0f || d > 1.0f) continue;
+        float topf = (float)base - amp * __builtin_powf(1.0f - d * d, 1.6f);
+        int top = (int)topf;
+        for (int y = top; y <= base; y++) {
+            int below = base - y;                       /* px down from the ridge */
+            int haze_amt = below < 18 ? (18 - below) * 255 / 18 : 0;
+            slop_blend(x, y, slop_mix(col, haze, haze_amt), 255);
+        }
+        slop_blend(x, top, SLOP_RGB(0xd8, 0xe2, 0xff), 34);
+    }
+}
+
+/* Thin dithered foam line where the water meets the land. */
+static void wall_foam(int y, int x0, int x1, int strength) {
+    for (int x = x0; x < x1; x++) {
+        int a = strength + (int)(__builtin_sinf((float)x * 0.15f) * 6.0f);
+        slop_blend(x, y + ((x >> 1) & 1), SLOP_RGB(0xe8, 0xf0, 0xff), wall_iclamp(a, 0, 255));
+        if ((x & 3) == 0)
+            slop_blend(x, y + 2, SLOP_RGB(0xe8, 0xf0, 0xff), strength / 2);
+    }
+}
+
+/* A gull: two short strokes, drawn dim so it reads as distance. */
+static void wall_bird(int x, int y, int s) {
+    slop_line(x - s, y, x, y - s / 2, SLOP_RGB(0x24, 0x2b, 0x36));
+    slop_line(x, y - s / 2, x + s, y, SLOP_RGB(0x24, 0x2b, 0x36));
+}
 
 static void build_wallpaper(void) {
     size_t n = (size_t)slop.w * slop.h;
@@ -436,26 +543,81 @@ static void build_wallpaper(void) {
     if (!wall_cache) return;
     slop_color *save = slop.back;
     slop.back = wall_cache;
-    slop_vgradient(0, 0, slop.w, slop.h, WALL_TOP, WALL_BOT);
-    float p = slop_pulse(9000);
-    int cx = slop.w / 2;
-    for (int i = 0; i < 3; i++) {
-        int r = 240 + i * 130 + (int)(p * 18);
-        slop_color col = i == 0 ? SLOP_RGB(0x2b, 0x3c, 0x8f)
-                      : i == 1 ? SLOP_RGB(0x1e, 0x5a, 0x6e)
-                               : SLOP_RGB(0x4a, 0x2a, 0x6e);
-        for (int a = 0; a < 360; a += 3) {
-            float rad = a * 3.14159265f / 180.0f;
-            int x = cx + (int)(__builtin_cosf(rad) * r);
-            int y = slop.h / 2 - 30 + (int)(__builtin_sinf(rad) * r / 2);
-            if (x < 0 || x >= slop.w || y < 0 || y >= slop.h) continue;
-            slop_blend(x, y, col, 24);
-            slop_blend(x + 1, y, col, 24);
+
+    const int fw = slop.w, fh = slop.h;
+    const int horizon = fh * 42 / 100;
+    const slop_color HAZE = SLOP_RGB(0xe9, 0xc4, 0x9c);
+
+    /* sky: deep twilight blue up top, pale gold at the waterline */
+    static const float sky_p[] = { 0.00f, 0.22f, 0.45f, 0.72f, 1.00f };
+    const slop_color sky_c[] = {
+        SLOP_RGB(0x0d, 0x1b, 0x3a),
+        SLOP_RGB(0x35, 0x42, 0x72),
+        SLOP_RGB(0x8c, 0x66, 0x7e),
+        SLOP_RGB(0xe8, 0x9d, 0x6a),
+        SLOP_RGB(0xf7, 0xd2, 0x9d),
+    };
+    wall_vstops(0, horizon, sky_p, sky_c, 5);
+
+    /* low sun on the horizon, with a wide warm halo */
+    int sunx = fw * 58 / 100, suny = horizon - fh / 80;
+    wall_glow(sunx, suny, fw / 4, SLOP_RGB(0xff, 0xc8, 0x86), 34);
+    wall_glow(sunx, suny, fw / 12, SLOP_RGB(0xff, 0xea, 0xc4), 80);
+    slop_fill_circle(sunx, suny, fw / 60, SLOP_RGB(0xff, 0xe6, 0xb0));
+
+    /* a moon in the same sky -- the surreal touch */
+    wall_moon(fw * 21 / 100, fh * 14 / 100, fw / 70);
+
+    /* clouds: a lit bank by the moon, a shadowed one drifting past the sun */
+    wall_cloud(fw * 22 / 100, fh * 17 / 100, fw / 6, fh / 30, SLOP_RGB(0xf0, 0xd2, 0xb2), 120);
+    wall_cloud(fw * 37 / 100, fh * 23 / 100, fw / 5, fh / 32, SLOP_RGB(0xbb, 0xa8, 0xd0), 110);
+    wall_cloud(fw * 66 / 100, fh * 20 / 100, fw / 6, fh / 30, SLOP_RGB(0x8e, 0x7f, 0xac), 110);
+    wall_cloud(fw * 85 / 100, fh * 11 / 100, fw / 8, fh / 30, SLOP_RGB(0x6b, 0x64, 0x92), 90);
+    wall_cloud(fw * 50 / 100, fh * 33 / 100, fw / 7, fh / 46, SLOP_RGB(0x4b, 0x44, 0x66), 90);
+
+    /* water: hazy teal at the horizon, near-black in the foreground */
+    static const float wat_p[] = { 0.00f, 0.30f, 1.00f };
+    const slop_color wat_c[] = {
+        SLOP_RGB(0x4a, 0x62, 0x74),
+        SLOP_RGB(0x14, 0x22, 0x3c),
+        SLOP_RGB(0x05, 0x08, 0x14),
+    };
+    wall_vstops(horizon, fh - horizon, wat_p, wat_c, 3);
+
+    /* atmospheric haze band so water and sky meet softly, not on a hard line */
+    for (int dy = -3; dy <= 8; dy++) {
+        int y = horizon + dy;
+        if (y < 0 || y >= fh) continue;
+        int a = dy < 0 ? 60 + dy * 15 : 90 - dy * 10;
+        if (a > 0) slop_fill_rect_a(0, y, fw, 1, HAZE, a);
+    }
+
+    /* the sun path shimmering down the water */
+    for (int y = horizon; y < fh; y++) {
+        float d = (float)(y - horizon) / (float)(fh - horizon);
+        int half = (int)(fw / 30 + d * fw / 12);
+        int a = (int)(70.0f * (1.0f - d * 0.85f));
+        for (int x = sunx - half; x <= sunx + half; x++) {
+            if ((x * 7 + y * 13) % 11 > 3) continue;
+            float fx = (float)(x - sunx) / (float)(half > 0 ? half : 1);
+            int aa = (int)(a * (1.0f - fx * fx));
+            if (aa > 0) slop_blend(x, y, SLOP_RGB(0xff, 0xe2, 0xb0), aa);
         }
     }
-    for (int y = 0; y < slop.h; y += 3)
-        for (int x = 0; x < slop.w; x += 3)
-            slop_blend(x, y, SLOP_RGB(0xff, 0xff, 0xff), 5);
+
+    /* headlands framing the view, foam at their feet */
+    wall_headland(fw * 8 / 100, horizon + 1, fh * 13 / 100.0f, fw * 22 / 100.0f,
+                  SLOP_RGB(0x0a, 0x0f, 0x1c), HAZE);
+    wall_headland(fw * 91 / 100, horizon + 2, fh * 9 / 100.0f, fw * 20 / 100.0f,
+                  SLOP_RGB(0x08, 0x0c, 0x18), HAZE);
+    wall_foam(horizon + 1, 0, fw * 26 / 100, 90);
+    wall_foam(horizon + 2, fw * 72 / 100, fw, 80);
+
+    /* gulls */
+    wall_bird(fw * 40 / 100, fh * 18 / 100, fw / 120 + 3);
+    wall_bird(fw * 45 / 100, fh * 21 / 100, fw / 150 + 2);
+    wall_bird(fw * 51 / 100, fh * 16 / 100, fw / 130 + 2);
+
     slop.back = save;
 }
 
