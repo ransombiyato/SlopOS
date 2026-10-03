@@ -61,7 +61,10 @@ user: $(INIT_BIN) $(SHELL_BIN) $(APP_BINS) $(COMPAT_BIN)
 kernel:
 	./kernel/build.sh
 
-image: user
+image:
+	@mkdir -p dist
+	rm -rf dist/rootfs
+	$(MAKE) user
 	./tools/mkimage.sh
 
 iso: image
@@ -83,6 +86,12 @@ shots: iso
 	python3 tools/screenshot.py dist/about.png --wait 20 --keys 8 --post-wait 4
 	python3 tools/screenshot.py dist/compat.png --wait 20 --keys 5 --post-wait 5
 	python3 tools/montage.py
+
+# Prove the third-party launch path with a dynamic stand-in (see the script).
+verify-compat: iso
+	./tools/verify-compat.sh zen
+	./tools/verify-compat.sh obs
+	./tools/verify-compat.sh resolve
 
 clean:
 	rm -rf $(DIST) $(BIN) libslop/*.o

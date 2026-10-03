@@ -37,6 +37,27 @@ for b in slop-shell slop-files slop-term slop-image slop-view slop-about slop-op
   ln -sf "/usr/bin/$b" "$ROOT/bin/$b"
 done
 
+# Dynamic runtime for third-party apps. Native SlopOS apps are static, but
+# Zen/OBS/Resolve are ordinary dynamically linked ELF programs and need a
+# glibc loader and friends on the image. This is part of the compatibility
+# world only; nothing native depends on it.
+GLIBC=/lib/x86_64-linux-gnu
+mkdir -p "$ROOT/lib/x86_64-linux-gnu" "$ROOT/lib64" "$ROOT/usr/lib"
+if [ -e "$GLIBC/libc.so.6" ]; then
+  for so in libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 \
+            libgcc_s.so.1 libresolv.so.2 libnss_dns.so.2 libnss_files.so.2; do
+    [ -e "$GLIBC/$so" ] && cp -fL "$GLIBC/$so" "$ROOT/lib/x86_64-linux-gnu/$so"
+  done
+  # the ELF interpreter lives at /lib64/ld-linux-x86-64.so.2
+  if [ -e "$GLIBC/ld-linux-x86-64.so.2" ]; then
+    cp -fL "$GLIBC/ld-linux-x86-64.so.2" "$ROOT/lib64/ld-linux-x86-64.so.2"
+    ln -sf /lib/x86_64-linux-gnu "$ROOT/usr/lib/x86_64-linux-gnu"
+  fi
+  echo ">> glibc runtime staged for third-party apps"
+else
+  echo "!! glibc not found; third-party apps will not be able to exec"
+fi
+
 # compatibility manifests
 cp -f compat/apps/*.app "$ROOT/usr/share/slop/compat/"
 

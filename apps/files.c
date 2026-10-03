@@ -52,21 +52,23 @@ static int cmp_entry(const void *a, const void *b) {
 }
 
 static void load_dir(const char *path) {
-    char real[1024];
+    char real[2048];
     if (!realpath(path, real)) {
         snprintf(status, sizeof(status), "Cannot open %s: %s", path, strerror(errno));
         return;
     }
-    strncpy(cwd, real, sizeof(cwd) - 1);
+    if (strlen(real) >= sizeof(cwd)) { snprintf(status, sizeof(status), "Path too long"); return; }
+    memcpy(cwd, real, strlen(real) + 1);
     nents = 0;
     DIR *d = opendir(cwd);
-    if (!d) { snprintf(status, sizeof(status), "Cannot read %s", cwd); return; }
+    if (!d) { snprintf(status, sizeof(status), "Cannot read %.240s", cwd); return; }
     struct dirent *de;
     while ((de = readdir(d)) && nents < MAX_ENTRIES) {
         if (!strcmp(de->d_name, ".")) continue;
         entry_t *e = &ents[nents];
-        snprintf(e->name, sizeof(e->name), "%s", de->d_name);
-        char full[2048];
+        if (snprintf(e->name, sizeof(e->name), "%s", de->d_name) >= (int)sizeof(e->name))
+            continue;
+        char full[4096];
         snprintf(full, sizeof(full), "%s/%s", cwd, de->d_name);
         struct stat st;
         if (lstat(full, &st) == 0) {
@@ -89,7 +91,7 @@ static void load_dir(const char *path) {
 static void go_parent(void) {
     if (!strcmp(cwd, "/")) return;
     char up[1024];
-    strncpy(up, cwd, sizeof(up) - 1);
+    snprintf(up, sizeof(up), "%s", cwd);
     char *s = strrchr(up, '/');
     if (s && s != up) *s = 0; else strcpy(up, "/");
     load_dir(up);
@@ -135,7 +137,7 @@ static void launch_viewer(const char *path) {
 
 static void activate(int i) {
     if (i < 0 || i >= nents) return;
-    char full[2048];
+    char full[4096];
     snprintf(full, sizeof(full), "%s/%s", cwd, ents[i].name);
     if (ents[i].is_dir) load_dir(full);
     else launch_viewer(full);
@@ -167,7 +169,7 @@ static void draw_crumbs(int x, int y, int w, int h) {
     slop_text_vcenter(&slop_font_body, px, y, h, "/", slop_theme_dark.text_mute);
     px += slop_text_w(&slop_font_body, "/") + 2;
     char tmp[1024];
-    strncpy(tmp, cwd, sizeof(tmp) - 1);
+    snprintf(tmp, sizeof(tmp), "%s", cwd);
     char *save = NULL;
     for (char *tok = strtok_r(tmp, "/", &save); tok; tok = strtok_r(NULL, "/", &save)) {
         int tw = slop_text_w(&slop_font_body, tok);

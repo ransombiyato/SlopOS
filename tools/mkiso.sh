@@ -51,12 +51,12 @@ terminal_output gfxterm
 $THEME
 
 menuentry "SlopOS 0.1" {
-    linux /boot/bzImage quiet loglevel=3 rdinit=/init
+    linux /boot/bzImage quiet loglevel=3 console=ttyS0,115200 rdinit=/init
     initrd /boot/initramfs.cpio.gz
 }
 
 menuentry "SlopOS 0.1 (verbose boot)" {
-    linux /boot/bzImage loglevel=7 rdinit=/init
+    linux /boot/bzImage loglevel=7 console=ttyS0,115200 rdinit=/init
     initrd /boot/initramfs.cpio.gz
 }
 EOF

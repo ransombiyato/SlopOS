@@ -39,9 +39,10 @@ make user           # build libslop, the shell, apps and the runtime
 make image          # assemble the rootfs + initramfs
 make iso            # pack a hybrid BIOS+UEFI ISO
 make shots          # boot once per app and capture screenshots
+make verify-compat  # prove the third-party launch path end to end
 ```
 
-The ISO is `dist/slopos.iso` (~31 MB). It boots on BIOS and UEFI machines;
+The ISO is `dist/slopos.iso` (~35 MB). It boots on BIOS and UEFI machines;
 the same image also works as a USB stick (`dd` it to a device).
 
 ### Requirements
@@ -118,8 +119,14 @@ dist/       build output (rootfs, initramfs, slopos.iso)
 
 ## Status
 
-Working and verified end-to-end in QEMU: boot, desktop, Files, Terminal,
-Image Viewer, File Viewer, System Info, and the compatibility readiness
-screens for all three third-party apps. To actually *run* Zen/OBS/Resolve,
-install them on the rootfs (see `compat/README.md`); the runtime already
-verifies every requirement they declare.
+Working and verified end-to-end in QEMU: boot (BIOS and UEFI), desktop,
+Files, Terminal, Image Viewer, File Viewer, System Info, and the
+compatibility readiness screens for all three third-party apps.
+
+The compatibility *launch* path is verified too: `make verify-compat` installs
+a dynamically linked stand-in for each app and checks that `slop-launch`
+detects it, execs it through the staged glibc loader, and hands it the right
+profile environment. What the runtime cannot ship is the apps themselves —
+Zen, OBS and Resolve are not redistributable — so install them onto the rootfs
+(see [compat/README.md](compat/README.md)) and the same code path runs the
+real binaries.

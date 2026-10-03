@@ -18,6 +18,7 @@
 static slop_image img;
 static int have_img = 0;
 static char cur_path[1024];
+static char dir_path[1024];
 static char status[256];
 static float zoom = 1.0f;
 static int pan_x = 0, pan_y = 0;
@@ -34,18 +35,18 @@ static int is_image(const char *name) {
 
 static void scan_siblings(const char *path) {
     nsib = 0;
-    char dir[1024];
-    snprintf(dir, sizeof(dir), "%s", path);
-    char *s = strrchr(dir, '/');
-    if (s) *s = 0; else strcpy(dir, ".");
-    DIR *d = opendir(dir);
-    if (!d) return;
+    snprintf(dir_path, sizeof(dir_path), "%s", path);
+    char *s = strrchr(dir_path, '/');
+    if (s) *s = 0; else strcpy(dir_path, ".");
     struct dirent *de;
+    DIR *d = opendir(dir_path);
+    if (!d) return;
     while ((de = readdir(d)) && nsib < 256) {
         if (de->d_name[0] == '.') continue;
         if (!is_image(de->d_name)) continue;
-        snprintf(siblings[nsib], sizeof(siblings[0]), "%s/%s", dir, de->d_name);
-        if (!strcmp(siblings[nsib], path)) sib_sel = nsib;
+        if (snprintf(siblings[nsib], sizeof(siblings[0]), "%s", de->d_name)
+                >= (int)sizeof(siblings[0])) continue;
+        if (!strcmp(siblings[nsib], slop_basename(path))) sib_sel = nsib;
         nsib++;
     }
     closedir(d);
@@ -55,7 +56,7 @@ static void load(const char *path) {
     if (have_img) { slop_image_free(&img); have_img = 0; }
     if (slop_image_load(path, &img) == 0) {
         have_img = 1;
-        strncpy(cur_path, path, sizeof(cur_path) - 1);
+        snprintf(cur_path, sizeof(cur_path), "%s", path);
         zoom = 1.0f; pan_x = pan_y = 0; rotation = 0;
         snprintf(status, sizeof(status), "%dx%d  -  %s", img.w, img.h, slop_basename(path));
     } else {
@@ -70,7 +71,7 @@ static void load_index(int i) {
 }
 
 /* Bilinear-ish scaled draw with rotation (90-degree steps). */
-static void draw_image_region(int cx, int cy, int area_w, int area_h) {
+static void draw_image_region(int cx, int cy) {
     if (!have_img) return;
     int dw = (int)(img.w * zoom);
     int dh = (int)(img.h * zoom);
@@ -158,7 +159,7 @@ int main(int argc, char **argv) {
 
         if (have_img) {
             int cxc = cvx + cvw / 2, cyc = cvy + cvh / 2;
-            draw_image_region(cxc, cyc, cvw, cvh);
+            draw_image_region(cxc, cyc);
             /* border */
             int dw = (int)(img.w * zoom), dh = (int)(img.h * zoom);
             if (rotation == 90 || rotation == 270) { int t = dw; dw = dh; dh = t; }
@@ -195,8 +196,10 @@ int main(int argc, char **argv) {
             int hot = ui.mx >= fx && ui.mx < fx + 54 && ui.my >= fs_y && ui.my < fs_y + 54;
             slop_fill_round(fx, fs_y, 54, 54, 6, i == sib_sel ? slop_theme_dark.accent :
                             hot ? slop_theme_dark.surface_hi : slop_theme_dark.surface_lo);
+            char full[2048];
+            int fl = snprintf(full, sizeof(full), "%s/%s", dir_path, siblings[i]);
             slop_image thumb;
-            if (slop_image_load(siblings[i], &thumb) == 0) {
+            if (fl >= 0 && fl < (int)sizeof(full) && slop_image_load(full, &thumb) == 0) {
                 float sc = 44.0f / thumb.w; if (thumb.h * sc > 44) sc = 44.0f / thumb.h;
                 slop_image_draw_scaled(&thumb, fx + 5, fs_y + 5, (int)(thumb.w * sc), (int)(thumb.h * sc));
                 slop_image_free(&thumb);

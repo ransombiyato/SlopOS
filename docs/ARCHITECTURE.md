@@ -98,6 +98,14 @@ If no launcher is found it draws a **readiness screen** listing the probed
 features, the library count, the paths it looked in, and an install hint —
 instead of silently failing.
 
+Because the third-party apps are dynamically linked (they start with the ELF
+interpreter `/lib64/ld-linux-x86-64.so.2`), the image also stages a glibc
+runtime for them: `tools/mkimage.sh` copies the loader plus
+`libc`/`libm`/`libdl`/`libpthread`/`librt`/`libgcc_s` into the rootfs. The
+native apps stay static and never touch it. `tools/verify-compat.sh` proves
+the whole chain by placing a dynamic stand-in at each app's declared path and
+confirming `slop-launch` execs it with the profile applied.
+
 Because it checks real kernel features rather than guessing, the readiness
 screen is a genuine compatibility report: on a correctly configured SlopOS
 kernel every declared feature shows green.

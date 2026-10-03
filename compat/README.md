@@ -104,17 +104,40 @@ The heaviest case: Qt5, OpenCL (`ocl-icd-libopencl1` + a vendor ICD),
 fails it falls back to software rendering; `RESOLVE_GPU_MODE=auto` lets the
 runtime pick.
 
-## Verifying without the apps
+## The dynamic runtime
 
-```sh
-# build a tiny static probe binary for the rootfs
-gcc -static -O2 -o dist/rootfs/usr/bin/slop-launch-probe compat/probe.c
+Native SlopOS apps are statically linked. Third-party apps are not: they are
+ordinary dynamically linked ELF binaries that begin with
 
-# then, inside a booted SlopOS terminal:
-slop-launch zen          # shows the readiness screen / launches it
-slop-launch obs
-slop-launch resolve
+```
+/lib64/ld-linux-x86-64.so.2
 ```
 
-The readiness screen is a real report: every kernel feature that SlopOS
+so the image ships a glibc runtime for them (`tools/mkimage.sh` copies
+`ld-linux-x86-64.so.2` plus `libc/libm/libdl/libpthread/librt/libgcc_s/...`
+into the rootfs). Nothing native depends on it; it exists only so the
+compatibility world can `exec` real programs.
+
+## Verifying the launch path without the apps
+
+`tools/verify-compat.sh <zen|obs|resolve>` proves the whole chain without the
+(non-redistributable) apps. It installs a tiny **dynamically linked** stand-in
+at the app's declared path; the stand-in only proceeds if `slop-launch` applied
+the graphical profile, and then execs a native app we can see. A run therefore
+proves, in order:
+
+1. the manifest was parsed;
+2. the kernel features were probed;
+3. the dynamic binary was detected and exec'd through the staged glibc loader;
+4. the profile environment reached the child.
+
+```sh
+make verify-compat        # all three
+./tools/verify-compat.sh zen
+```
+
+A pass means the frame is pixel-identical to the About screen (the stand-in
+exec'd it); a fail leaves the readiness screen on screen.
+
+The readiness screen itself is a real report: every kernel feature that SlopOS
 supports shows a green dot, and the library counter reflects the host rootfs.

@@ -18,6 +18,7 @@ make image    # rootfs + initramfs.cpio.gz
 make iso      # dist/slopos.iso (hybrid BIOS+UEFI)
 make run      # boot in QEMU
 make shots    # boot per app and capture dist/*.png + docs/screenshots.png
+make verify-compat   # prove the third-party launch path (dynamic stand-in)
 make clean
 ```
 All userland is linked `-static`; the initramfs must be self-contained.
@@ -40,6 +41,11 @@ All userland is linked `-static`; the initramfs must be self-contained.
   Use these to automate per-app screenshots.
 - `tools/screenshot.py` needs Pillow. UEFI test uses OVMF if present.
 - `/dev/pts` must be mounted by `init` or the terminal has no pty.
+- `tools/verify-compat.sh APP` proves the compat *launch* path with a dynamic
+  stand-in; it needs `dist/about.png` as a reference (`make shots` first).
+- A console is attached (`console=ttyS0`), but the kernel keeps it as a
+  non-primary console while the fbcon is primary, so app stderr does not land
+  in the serial log. Verify launches by framebuffer, not log scraping.
 
 ## Gotchas
 - GRUB config must guard BIOS-only modules (`vbe`, `video_bochs`) behind
